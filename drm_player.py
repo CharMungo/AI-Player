@@ -466,7 +466,7 @@ def play_video(display, path, position):
         for frame in packet.decode():
             t0 = time.monotonic()
             f  = frame.reformat(format="rgba")
-            display.present(f.planes[0].to_bytes(), f.width, f.height, position)
+            display.present(bytes(f.planes[0]), f.width, f.height, position)
             remaining = frame_dur - (time.monotonic() - t0)
             if remaining > 0:
                 time.sleep(remaining)
