@@ -6,14 +6,16 @@ Usage:  python3 drm_player.py [playlist.toml]
 
 Requirements (Raspberry Pi OS / Debian):
     sudo apt install python3-pillow python3-numpy ffmpeg
-    pip3 install av
 
 Requirements (Arch):
-    sudo pacman -S python-pillow python-numpy python-pyav ffmpeg
+    sudo pacman -S python-pillow python-numpy ffmpeg
+
+No PyAV needed — ffmpeg is called directly as a subprocess,
+which gives true multi-core decoding and hardware acceleration.
 """
 
-import sys, os, time, ctypes, mmap, traceback
-import threading, queue
+import sys, os, time, ctypes, mmap, traceback, subprocess, struct
+import threading
 from pathlib import Path
 
 # ── TOML ─────────────────────────────────────────────────────────────────────
@@ -40,11 +42,12 @@ try:
 except ImportError:
     sys.exit("Install numpy:  sudo apt install python3-numpy")
 
-# ── PyAV ─────────────────────────────────────────────────────────────────────
-try:
-    import av
-except ImportError:
-    sys.exit("Install PyAV:  pip3 install av")
+# ── ffmpeg (just needs to be on PATH) ────────────────────────────────────────
+import shutil
+if not shutil.which("ffmpeg"):
+    sys.exit("ffmpeg not found. Install:  sudo apt install ffmpeg")
+if not shutil.which("ffprobe"):
+    sys.exit("ffprobe not found. Install:  sudo apt install ffmpeg")
 
 # ── libc ioctl ────────────────────────────────────────────────────────────────
 _libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -182,48 +185,6 @@ class AddFB(ctypes.Structure):
 
 class RmFB(ctypes.Structure):
     _fields_ = [("fb_id", ctypes.c_uint32)]
-
-
-# =============================================================================
-# Pixel conversion  (numpy — vectorised, releases GIL, uses all cores)
-# =============================================================================
-
-def rgba_to_bgrx(rgba: np.ndarray, dst_w: int, dst_h: int,
-                 src_w: int, src_h: int,
-                 off_x: int, off_y: int, pitch: int) -> bytes:
-    """
-    Convert an RGBA numpy array to a full-display-size XRGB8888 buffer.
-    All heavy lifting is done in numpy (C speed, GIL released).
-    Returns raw bytes ready to write into the dumb buffer.
-    """
-    # Output buffer: dst_h rows × pitch bytes, zero-filled (black)
-    out = np.zeros((dst_h, pitch), dtype=np.uint8)
-
-    copy_w = min(src_w, dst_w - off_x)
-    copy_h = min(src_h, dst_h - off_y)
-
-    # Slice the destination region
-    dst_region = out[off_y : off_y + copy_h,
-                     off_x * 4 : off_x * 4 + copy_w * 4]
-
-    # Slice the source (handle oversized content)
-    src_region = rgba[:copy_h, :copy_w, :]  # (copy_h, copy_w, 4)
-
-    # Reshape destination to (copy_h, copy_w, 4) for channel assignment
-    dst_pix = dst_region.reshape(copy_h, copy_w, 4)
-
-    # RGBA → BGRX  (XRGB8888 stored little-endian = B G R X in memory)
-    dst_pix[:, :, 0] = src_region[:, :, 2]  # B ← R
-    dst_pix[:, :, 1] = src_region[:, :, 1]  # G
-    dst_pix[:, :, 2] = src_region[:, :, 0]  # R ← B
-    dst_pix[:, :, 3] = 0                     # X
-
-    return out.tobytes()
-
-
-def frame_to_rgba_array(rgba_bytes: bytes, w: int, h: int) -> np.ndarray:
-    """Wrap raw RGBA bytes as a numpy array (zero-copy view)."""
-    return np.frombuffer(rgba_bytes, dtype=np.uint8).reshape(h, w, 4)
 
 
 # =============================================================================
@@ -378,11 +339,11 @@ class DRMDisplay:
             except OSError: pass
             self._current_handle = None
 
-    def present_raw(self, bgrx_bytes: bytes):
+    def present_bgr0(self, data: bytes):
         """
-        Upload a pre-converted BGRX buffer (full display size) and flip to it.
-        Pixel conversion should already be done (off the main thread) before
-        calling this.
+        Upload a BGR0 buffer (already display-sized, no conversion needed)
+        and flip to it. Free the previous buffer after the flip.
+        BGR0 == XRGB8888 in memory — exactly what the DRM dumb buffer expects.
         """
         create        = CreateDumb()
         create.width  = self.width
@@ -400,7 +361,7 @@ class DRMDisplay:
 
         with mmap.mmap(self.fd, size, offset=md.offset) as buf:
             buf.seek(0)
-            buf.write(bgrx_bytes[:size])
+            buf.write(data[:size])
 
         fb        = AddFB()
         fb.width  = self.width
@@ -424,24 +385,29 @@ class DRMDisplay:
         sc.mode               = self._mode
         self._ioctl(DRM_IOCTL_MODE_SETCRTC, sc)
 
-        # Free old buffer now that display is scanning the new one
         self._free_current()
         self._current_fb     = new_fb_id
         self._current_handle = new_handle
 
-    def present(self, rgba_bytes: bytes, src_w: int, src_h: int, position: str):
-        """Convert RGBA→BGRX (numpy) then upload. Used for images."""
-        off_x, off_y = _offset(src_w, src_h, self.width, self.height, position)
+    def present_rgba(self, rgba: bytes, src_w: int, src_h: int, position: str):
+        """For images: convert RGBA→BGR0 with numpy, pad to display size, flip."""
+        dw, dh = self.width, self.height
+        off_x, off_y = _offset(src_w, src_h, dw, dh, position)
+        copy_w = min(src_w, dw - off_x)
+        copy_h = min(src_h, dh - off_y)
 
-        # Get pitch by creating a temporary dumb buffer just to read pitch,
-        # then immediately reuse it. Simpler: just compute pitch as width*4
-        # (always true for 32bpp with no special alignment on Pi).
-        pitch = self.width * 4
+        # Full black canvas in BGR0 layout
+        out = np.zeros((dh, dw, 4), dtype=np.uint8)
 
-        rgba_arr = frame_to_rgba_array(rgba_bytes, src_w, src_h)
-        bgrx = rgba_to_bgrx(rgba_arr, self.width, self.height,
-                             src_w, src_h, off_x, off_y, pitch)
-        self.present_raw(bgrx)
+        src = np.frombuffer(rgba, dtype=np.uint8).reshape(src_h, src_w, 4)
+
+        # RGBA → BGR0  (B G R 0 in memory = XRGB8888 little-endian)
+        out[off_y:off_y+copy_h, off_x:off_x+copy_w, 0] = src[:copy_h, :copy_w, 2]  # B
+        out[off_y:off_y+copy_h, off_x:off_x+copy_w, 1] = src[:copy_h, :copy_w, 1]  # G
+        out[off_y:off_y+copy_h, off_x:off_x+copy_w, 2] = src[:copy_h, :copy_w, 0]  # R
+        # channel 3 stays 0
+
+        self.present_bgr0(out.tobytes())
 
     def close(self):
         self._free_current()
@@ -470,119 +436,120 @@ IMAGE_EXTS = {".jpg",".jpeg",".png",".gif",".bmp",".tiff",".tif",".webp"}
 def play_image(display: DRMDisplay, path: Path, duration: float, position: str):
     print(f"Image: {path}", file=sys.stderr)
     img = Image.open(path).convert("RGBA")
-    display.present(img.tobytes(), img.width, img.height, position)
+    display.present_rgba(img.tobytes(), img.width, img.height, position)
     time.sleep(duration)
 
 
 # =============================================================================
-# Video  — pipelined decode + display across two cores
+# Video — ffmpeg subprocess pipes BGR0 frames directly into DRM
 #
-#  Thread A (decoder):  PyAV decode → numpy pixel conversion → queue
-#  Thread B (main):     queue → dumb buffer upload → set_crtc → pace to FPS
+# ffmpeg runs as a completely separate OS process with its own threads,
+# bypassing Python's GIL entirely. It handles:
+#   - Multi-threaded software decoding  (-threads 0 = use all cores)
+#   - Hardware decoding on Pi           (h264_v4l2m2m, hevc_v4l2m2m)
+#   - Pixel format conversion           (outputs bgr0 = XRGB8888)
+#   - Padding / positioning             (pad filter)
+#   - FPS pacing                        (we read one frame per tick)
 #
-#  PyAV decode and numpy both release the GIL, so they genuinely run
-#  on separate cores despite Python's GIL.
+# Python only reads the pipe and calls set_crtc — almost zero CPU.
 # =============================================================================
 
-_SENTINEL = None   # signals decoder thread to stop
-_QUEUE_DEPTH = 4   # how many pre-converted frames to buffer
+def _probe_video(path: Path):
+    """Return (width, height, fps_num, fps_den) via ffprobe."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error",
+         "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,r_frame_rate",
+         "-of", "csv=p=0",
+         str(path)],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {result.stderr.strip()}")
+    parts = result.stdout.strip().split(",")
+    w, h  = int(parts[0]), int(parts[1])
+    num, den = parts[2].split("/")
+    return w, h, int(num), int(den)
 
 
-def _decoder_thread(container, stream, display_w, display_h,
-                    position: str, out_q: queue.Queue, stop_evt: threading.Event):
-    """
-    Runs on a background thread.
-    Decodes frames, converts RGBA→BGRX with numpy, pushes bytes into out_q.
-    """
-    pitch = display_w * 4
+def _hw_decoders():
+    """Return list of available hardware decoders to try, in preference order."""
+    # Check which V4L2 M2M devices exist (Pi hardware decoders)
+    decoders = []
     try:
-        for packet in container.demux(stream):
-            if stop_evt.is_set():
-                break
-            for frame in packet.decode():
-                if stop_evt.is_set():
-                    break
-
-                # Reformat to RGBA — PyAV releases GIL during decode
-                f = frame.reformat(format="rgba")
-                src_w = f.width
-                src_h = f.height
-
-                # numpy pixel conversion — also releases GIL
-                rgba_arr = np.frombuffer(bytes(f.planes[0]),
-                                         dtype=np.uint8).reshape(src_h, src_w, 4)
-                off_x, off_y = _offset(src_w, src_h, display_w, display_h, position)
-                bgrx = rgba_to_bgrx(rgba_arr, display_w, display_h,
-                                    src_w, src_h, off_x, off_y, pitch)
-
-                # Block if the display thread is falling behind
-                # (avoids unbounded memory use)
-                while not stop_evt.is_set():
-                    try:
-                        out_q.put(bgrx, timeout=0.1)
-                        break
-                    except queue.Full:
-                        continue
-
-    except Exception as e:
-        print(f"  Decoder error: {e}", file=sys.stderr)
-        traceback.print_exc()
-    finally:
-        try:
-            out_q.put(_SENTINEL, timeout=1.0)
-        except queue.Full:
-            pass
-        container.close()
+        result = subprocess.run(["ffmpeg", "-hide_banner", "-decoders"],
+                                capture_output=True, text=True)
+        if "h264_v4l2m2m" in result.stdout:
+            decoders.append("h264_v4l2m2m")
+        if "hevc_v4l2m2m" in result.stdout:
+            decoders.append("hevc_v4l2m2m")
+    except Exception:
+        pass
+    return decoders
 
 
 def play_video(display: DRMDisplay, path: Path, position: str):
     print(f"Video: {path}", file=sys.stderr)
 
-    container = av.open(str(path))
-    stream = next((s for s in container.streams if s.type == "video"), None)
-    if not stream:
-        print("  No video stream, skipping", file=sys.stderr)
-        container.close()
+    try:
+        src_w, src_h, fps_num, fps_den = _probe_video(path)
+    except Exception as e:
+        print(f"  ffprobe failed ({e}), skipping", file=sys.stderr)
         return
 
-    for s in container.streams:
-        if s.type == "audio":
-            s.discard = "all"
+    dw, dh = display.width, display.height
+    off_x, off_y = _offset(src_w, src_h, dw, dh, position)
+    frame_dur = fps_den / fps_num if fps_num > 0 else 1/30
 
-    fps = float(stream.average_rate or stream.guessed_rate or 30)
-    frame_dur = 1.0 / fps if fps > 0 else 1/30
-    print(f"  {stream.width}x{stream.height} @ ~{fps:.2f}fps  "
-          f"(pipeline depth={_QUEUE_DEPTH})", file=sys.stderr)
+    print(f"  {src_w}x{src_h} @ {fps_num}/{fps_den}fps → "
+          f"display {dw}x{dh} offset ({off_x},{off_y})", file=sys.stderr)
 
-    frame_q  = queue.Queue(maxsize=_QUEUE_DEPTH)
-    stop_evt = threading.Event()
+    # Build ffmpeg filter:
+    # - pad the video to display size with black, placed at off_x/off_y
+    # - output format: bgr0 (= XRGB8888, no conversion needed in Python)
+    # - no audio (-an)
+    vf = f"pad={dw}:{dh}:{off_x}:{off_y}:black"
 
-    # Start decoder on a background thread
-    decoder = threading.Thread(
-        target=_decoder_thread,
-        args=(container, stream, display.width, display.height,
-              position, frame_q, stop_evt),
-        daemon=True,
-    )
-    decoder.start()
+    # Try hardware decoder for h264/hevc, fall back to software
+    codec = None
+    ext = path.suffix.lower()
+    hw_decoders = _hw_decoders()
+    if "h264_v4l2m2m" in hw_decoders and ext in (".mp4", ".mkv", ".avi", ".mov"):
+        codec = "h264_v4l2m2m"
+    elif "hevc_v4l2m2m" in hw_decoders and ext in (".mp4", ".mkv"):
+        codec = "hevc_v4l2m2m"
+
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
+    if codec:
+        cmd += ["-c:v", codec]
+    cmd += [
+        "-i", str(path),
+        "-an",                        # no audio
+        "-f", "rawvideo",             # raw output
+        "-pix_fmt", "bgr0",           # B G R 0 = XRGB8888, no Python conversion
+        "-vf", vf,                    # pad to display size + position
+        "-threads", "0",              # use all CPU cores for decoding
+        "pipe:1",                     # output to stdout
+    ]
+
+    print(f"  cmd: {' '.join(cmd)}", file=sys.stderr)
+
+    frame_size = dw * dh * 4   # bytes per frame (bgr0, 4 bytes/pixel)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
     try:
         while True:
             t0 = time.monotonic()
 
-            try:
-                bgrx = frame_q.get(timeout=5.0)
-            except queue.Empty:
-                print("  Decoder stalled — stopping", file=sys.stderr)
-                break
+            # Read exactly one frame from ffmpeg
+            data = proc.stdout.read(frame_size)
+            if len(data) < frame_size:
+                break  # EOF or error
 
-            if bgrx is _SENTINEL:
-                break
+            # Upload directly to DRM — no conversion, no GIL contention
+            display.present_bgr0(data)
 
-            # Upload + flip (main thread, holds DRM fd)
-            display.present_raw(bgrx)
-
-            # Pace playback to video FPS
+            # Pace to video FPS
             remaining = frame_dur - (time.monotonic() - t0)
             if remaining > 0:
                 time.sleep(remaining)
@@ -590,8 +557,9 @@ def play_video(display: DRMDisplay, path: Path, position: str):
     except KeyboardInterrupt:
         raise
     finally:
-        stop_evt.set()
-        decoder.join(timeout=3.0)
+        proc.stdout.close()
+        proc.terminate()
+        proc.wait()
 
 
 # =============================================================================
