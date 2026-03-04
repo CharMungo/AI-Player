@@ -23,13 +23,12 @@ import sys
 import os
 import time
 import ctypes
-import ctypes.util
 import fcntl
 import mmap
 import traceback
 from pathlib import Path
 
-# ── TOML loading (stdlib tomllib in 3.11+, else tomli) ───────────────────────
+# ── TOML loading ──────────────────────────────────────────────────────────────
 if sys.version_info >= (3, 11):
     import tomllib
 else:
@@ -46,19 +45,19 @@ else:
 try:
     from PIL import Image
 except ImportError:
-    print("Install Pillow:  sudo pacman -S python-pillow  /  sudo apt install python3-pillow", file=sys.stderr)
+    print("Install Pillow:  sudo apt install python3-pillow", file=sys.stderr)
     sys.exit(1)
 
 # ── Video decoding ────────────────────────────────────────────────────────────
 try:
     import av
 except ImportError:
-    print("Install PyAV:  sudo pacman -S python-pyav  /  pip3 install av", file=sys.stderr)
+    print("Install PyAV:  pip3 install av", file=sys.stderr)
     sys.exit(1)
 
 
 # =============================================================================
-# DRM / KMS constants and ioctl definitions
+# DRM / KMS ioctl definitions
 # =============================================================================
 
 DRM_IOCTL_BASE = ord('d')
@@ -67,26 +66,38 @@ def _IOC(dir_, type_, nr, size):
     return (dir_ << 30) | (type_ << 8) | nr | (size << 16)
 
 def _IOWR(type_, nr, size): return _IOC(3, type_, nr, size)
+def _IOW(type_, nr, size):  return _IOC(1, type_, nr, size)
 def _IO(type_, nr):         return _IOC(0, type_, nr, 0)
 
-DRM_IOCTL_SET_MASTER        = _IO  (DRM_IOCTL_BASE, 0x1e)
-DRM_IOCTL_DROP_MASTER       = _IO  (DRM_IOCTL_BASE, 0x1f)
-DRM_IOCTL_MODE_GETRESOURCES = _IOWR(DRM_IOCTL_BASE, 0xA0, 40)
-DRM_IOCTL_MODE_GETCONNECTOR = _IOWR(DRM_IOCTL_BASE, 0xA7, 80)
-DRM_IOCTL_MODE_GETENCODER   = _IOWR(DRM_IOCTL_BASE, 0xA6, 16)
-DRM_IOCTL_MODE_SETCRTC      = _IOWR(DRM_IOCTL_BASE, 0xA2, 120)
-DRM_IOCTL_MODE_CREATE_DUMB  = _IOWR(DRM_IOCTL_BASE, 0xB2, 32)
-DRM_IOCTL_MODE_MAP_DUMB     = _IOWR(DRM_IOCTL_BASE, 0xB3, 24)
-DRM_IOCTL_MODE_DESTROY_DUMB = _IOWR(DRM_IOCTL_BASE, 0xB4, 4)
-DRM_IOCTL_MODE_ADDFB        = _IOWR(DRM_IOCTL_BASE, 0xAE, 32)
-DRM_IOCTL_MODE_RMFB         = _IOWR(DRM_IOCTL_BASE, 0xAF, 4)
+DRM_IOCTL_SET_MASTER          = _IO  (DRM_IOCTL_BASE, 0x1e)
+DRM_IOCTL_DROP_MASTER         = _IO  (DRM_IOCTL_BASE, 0x1f)
+DRM_IOCTL_SET_CLIENT_CAP      = _IOW (DRM_IOCTL_BASE, 0x0d, 16)
+DRM_IOCTL_MODE_GETRESOURCES   = _IOWR(DRM_IOCTL_BASE, 0xA0, 40)
+DRM_IOCTL_MODE_GETCONNECTOR   = _IOWR(DRM_IOCTL_BASE, 0xA7, 80)
+DRM_IOCTL_MODE_GETENCODER     = _IOWR(DRM_IOCTL_BASE, 0xA6, 16)
+DRM_IOCTL_MODE_SETCRTC        = _IOWR(DRM_IOCTL_BASE, 0xA2, 120)
+DRM_IOCTL_MODE_CREATE_DUMB    = _IOWR(DRM_IOCTL_BASE, 0xB2, 32)
+DRM_IOCTL_MODE_MAP_DUMB       = _IOWR(DRM_IOCTL_BASE, 0xB3, 24)
+DRM_IOCTL_MODE_DESTROY_DUMB   = _IOWR(DRM_IOCTL_BASE, 0xB4, 4)
+DRM_IOCTL_MODE_ADDFB          = _IOWR(DRM_IOCTL_BASE, 0xAE, 32)
+DRM_IOCTL_MODE_RMFB           = _IOWR(DRM_IOCTL_BASE, 0xAF, 4)
 
-DRM_MODE_CONNECTOR_CONNECTED = 1
+# Client capabilities — must be set before querying resources on Pi/VC4
+DRM_CLIENT_CAP_UNIVERSAL_PLANES = 2
+DRM_CLIENT_CAP_ATOMIC           = 3
+
+DRM_MODE_CONNECTOR_CONNECTED    = 1
 
 
 # =============================================================================
-# ctypes structs matching kernel DRM uAPI
+# ctypes structs
 # =============================================================================
+
+class DrmSetClientCap(ctypes.Structure):
+    _fields_ = [
+        ("capability", ctypes.c_uint64),
+        ("value",      ctypes.c_uint64),
+    ]
 
 class DrmModeRes(ctypes.Structure):
     _fields_ = [
@@ -216,6 +227,15 @@ class DRMDisplay:
     def _ioctl(self, request, arg):
         return fcntl.ioctl(self.fd, request, arg)
 
+    def _set_cap(self, cap, value):
+        s = DrmSetClientCap()
+        s.capability = cap
+        s.value = value
+        try:
+            self._ioctl(DRM_IOCTL_SET_CLIENT_CAP, s)
+        except OSError:
+            pass  # not fatal — driver may not support it
+
     def _init(self, connector_index: int):
         # Acquire DRM master
         try:
@@ -226,14 +246,19 @@ class DRMDisplay:
                 "Run as root or add yourself to the 'video' group."
             ) from e
 
+        # ── Tell the kernel we support universal planes ───────────────────────
+        # Required on Pi/VC4 before GETRESOURCES will return connectors.
+        self._set_cap(DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1)
+        self._set_cap(DRM_CLIENT_CAP_ATOMIC, 1)
+
         # ── Get resource IDs (two-step: counts then data) ────────────────────
         res = DrmModeRes()
         self._ioctl(DRM_IOCTL_MODE_GETRESOURCES, res)
 
-        fb_arr        = (ctypes.c_uint32 * max(res.count_fbs, 1))()
-        crtc_arr      = (ctypes.c_uint32 * max(res.count_crtcs, 1))()
+        fb_arr        = (ctypes.c_uint32 * max(res.count_fbs,        1))()
+        crtc_arr      = (ctypes.c_uint32 * max(res.count_crtcs,      1))()
         connector_arr = (ctypes.c_uint32 * max(res.count_connectors, 1))()
-        encoder_arr   = (ctypes.c_uint32 * max(res.count_encoders, 1))()
+        encoder_arr   = (ctypes.c_uint32 * max(res.count_encoders,   1))()
 
         res.fb_id_ptr        = ctypes.addressof(fb_arr)
         res.crtc_id_ptr      = ctypes.addressof(crtc_arr)
@@ -274,7 +299,7 @@ class DRMDisplay:
             raise RuntimeError("No CRTC available for connector")
 
     def _get_connector(self, conn_id):
-        # First call with no pointers — kernel fills in the counts
+        # First call — get counts
         info = DrmModeGetConnector()
         info.connector_id = conn_id
         try:
@@ -286,10 +311,8 @@ class DRMDisplay:
               f"count_modes={info.count_modes} count_encoders={info.count_encoders}",
               file=sys.stderr)
 
-        # Second call with allocated arrays — kernel fills in the data.
-        # Use max(n, 1) to avoid zero-length arrays some drivers reject.
-        # Must also provide props arrays or the Pi's VC4 driver returns EFAULT.
-        modes_arr   = (DrmModeInfo    * max(info.count_modes,    1))()
+        # Second call — fill arrays
+        modes_arr   = (DrmModeInfo     * max(info.count_modes,    1))()
         encoder_arr = (ctypes.c_uint32 * max(info.count_encoders, 1))()
         props_arr   = (ctypes.c_uint32 * max(info.count_props,    1))()
         pvals_arr   = (ctypes.c_uint64 * max(info.count_props,    1))()
@@ -307,7 +330,6 @@ class DRMDisplay:
         return info, list(modes_arr)[:info.count_modes], list(encoder_arr)[:info.count_encoders]
 
     def _find_crtc(self, conn_info, encoder_ids):
-        # Try the currently active encoder's CRTC first
         if conn_info.encoder_id:
             enc = DrmModeGetEncoder()
             enc.encoder_id = conn_info.encoder_id
@@ -318,7 +340,6 @@ class DRMDisplay:
             except OSError:
                 pass
 
-        # Scan all encoders for a compatible CRTC
         for enc_id in encoder_ids:
             enc = DrmModeGetEncoder()
             enc.encoder_id = enc_id
@@ -352,19 +373,19 @@ class DRMDisplay:
 
             with mmap.mmap(self.fd, size, offset=map_dumb.offset) as buf:
                 buf.seek(0)
-                buf.write(b'\x00' * size)  # black background
+                buf.write(b'\x00' * size)
 
                 off_x, off_y = _compute_offset(src_w, src_h, self.width, self.height, position)
                 copy_w = min(src_w, self.width  - off_x)
                 copy_h = min(src_h, self.height - off_y)
-
                 src_stride = src_w * 4
+
                 for row in range(copy_h):
                     dst_offset = (off_y + row) * pitch + off_x * 4
                     src_offset = row * src_stride
                     row_rgba   = rgba_bytes[src_offset : src_offset + copy_w * 4]
 
-                    # Swap R↔B: RGBA → XRGB8888 (stored as B G R X in memory)
+                    # RGBA → XRGB8888 (B G R X in memory)
                     bgrx = bytearray(copy_w * 4)
                     bgrx[0::4] = row_rgba[2::4]  # B ← R
                     bgrx[1::4] = row_rgba[1::4]  # G
@@ -428,7 +449,7 @@ def _compute_offset(src_w, src_h, disp_w, disp_h, position):
         ox = (disp_w - src_w) // 2 if src_w < disp_w else 0
         oy = (disp_h - src_h) // 2 if src_h < disp_h else 0
         return ox, oy
-    return 0, 0  # top_left
+    return 0, 0
 
 
 # =============================================================================
@@ -526,7 +547,7 @@ def main():
     validate_config(cfg)
 
     display_cfg = cfg["display"]
-    device      = display_cfg.get("device", "/dev/dri/card0")
+    device      = display_cfg.get("device", "/dev/dri/card1")
     position    = display_cfg.get("position", "top_left")
     conn_index  = display_cfg.get("connector_index", 0)
     items       = cfg["playlist"]["items"]
