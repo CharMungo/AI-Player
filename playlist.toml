@@ -1,0 +1,33 @@
+# drm-player configuration file
+# Run with: drm-player playlist.toml
+
+[display]
+# DRM device to use
+device = "/dev/dri/card0"
+
+# Position for content smaller than the display:
+#   "center"   — centers the content on screen
+#   "top_left" — places content at the top-left corner (0,0)
+position = "center"
+
+# If you have multiple connected monitors, choose which one (0-based index)
+connector_index = 0
+
+[[playlist.items]]
+path = "/home/user/media/intro.mp4"
+# duration is ignored for videos — they play until the last frame
+
+[[playlist.items]]
+path = "/home/user/media/slide1.png"
+duration = 5.0   # seconds to display this image
+
+[[playlist.items]]
+path = "/home/user/media/slide2.jpg"
+duration = 8.0
+
+[[playlist.items]]
+path = "/home/user/media/demo.mkv"
+
+[[playlist.items]]
+path = "/home/user/media/outro.png"
+duration = 3.0
