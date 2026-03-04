@@ -14,20 +14,9 @@ position = "center"
 connector_index = 0
 
 [[playlist.items]]
-path = "/home/user/media/intro.mp4"
-# duration is ignored for videos — they play until the last frame
-
-[[playlist.items]]
-path = "/home/user/media/slide1.png"
+path = "/home/user/media/landscape-one.jpg"
 duration = 5.0   # seconds to display this image
 
 [[playlist.items]]
-path = "/home/user/media/slide2.jpg"
+path = "/home/user/media/landscape-two.jpg"
 duration = 8.0
-
-[[playlist.items]]
-path = "/home/user/media/demo.mkv"
-
-[[playlist.items]]
-path = "/home/user/media/outro.png"
-duration = 3.0
