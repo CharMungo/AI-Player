@@ -1,34 +1,21 @@
 #!/usr/bin/env python3
 """
-drm-player — a DRM/KMS media player for Linux systems without a window manager.
+drm-player — DRM/KMS media player for Linux without a window manager.
 
-Displays images and videos directly to the display via KMS/DRM.
-Reads a TOML playlist config. No audio. No window manager required.
-
-Usage:
-    python3 drm_player.py [playlist.toml]
-
-Requirements (Arch):
-    sudo pacman -S python-pillow python-pyav ffmpeg
+Usage:  python3 drm_player.py [playlist.toml]
 
 Requirements (Raspberry Pi OS / Debian):
     sudo apt install python3-pillow ffmpeg
     pip3 install av
 
-tomllib is stdlib in Python 3.11+. For older versions:
-    pip install tomli
+Requirements (Arch):
+    sudo pacman -S python-pillow python-pyav ffmpeg
 """
 
-import sys
-import os
-import time
-import ctypes
-import fcntl
-import mmap
-import traceback
+import sys, os, time, ctypes, mmap, traceback
 from pathlib import Path
 
-# ── TOML loading ──────────────────────────────────────────────────────────────
+# ── TOML ─────────────────────────────────────────────────────────────────────
 if sys.version_info >= (3, 11):
     import tomllib
 else:
@@ -38,175 +25,158 @@ else:
         try:
             import tomli as tomllib
         except ImportError:
-            print("Install tomli:  pip install tomli   (or use Python 3.11+)", file=sys.stderr)
-            sys.exit(1)
+            sys.exit("Install tomli:  pip install tomli  (or use Python 3.11+)")
 
-# ── Image loading ─────────────────────────────────────────────────────────────
+# ── Pillow ───────────────────────────────────────────────────────────────────
 try:
     from PIL import Image
 except ImportError:
-    print("Install Pillow:  sudo apt install python3-pillow", file=sys.stderr)
-    sys.exit(1)
+    sys.exit("Install Pillow:  sudo apt install python3-pillow")
 
-# ── Video decoding ────────────────────────────────────────────────────────────
+# ── PyAV ─────────────────────────────────────────────────────────────────────
 try:
     import av
 except ImportError:
-    print("Install PyAV:  pip3 install av", file=sys.stderr)
-    sys.exit(1)
+    sys.exit("Install PyAV:  pip3 install av")
+
+# ── libc ioctl (avoids fcntl.ioctl buffer-protocol issues with ctypes) ───────
+_libc = ctypes.CDLL("libc.so.6", use_errno=True)
+_libc.ioctl.restype  = ctypes.c_int
+_libc.ioctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p]
+
+def _ioctl(fd: int, request: int, arg) -> None:
+    """Call ioctl passing a direct C pointer to a ctypes struct."""
+    ret = _libc.ioctl(fd, request, ctypes.addressof(arg))
+    if ret != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
 
 
 # =============================================================================
-# DRM / KMS ioctl definitions
+# DRM ioctl numbers
 # =============================================================================
 
-DRM_IOCTL_BASE = ord('d')
+def _IOC(d, t, n, s): return (d<<30)|(t<<8)|n|(s<<16)
+def _IO(t,n):         return _IOC(0,t,n,0)
+def _IOW(t,n,s):      return _IOC(1,t,n,s)
+def _IOWR(t,n,s):     return _IOC(3,t,n,s)
 
-def _IOC(dir_, type_, nr, size):
-    return (dir_ << 30) | (type_ << 8) | nr | (size << 16)
+_D = ord('d')
 
-def _IOWR(type_, nr, size): return _IOC(3, type_, nr, size)
-def _IOW(type_, nr, size):  return _IOC(1, type_, nr, size)
-def _IO(type_, nr):         return _IOC(0, type_, nr, 0)
+DRM_IOCTL_SET_MASTER         = _IO  (_D, 0x1e)
+DRM_IOCTL_DROP_MASTER        = _IO  (_D, 0x1f)
+DRM_IOCTL_SET_CLIENT_CAP     = _IOW (_D, 0x0d, 16)
+DRM_IOCTL_MODE_GETRESOURCES  = _IOWR(_D, 0xA0, 64)   # sizeof = 64
+DRM_IOCTL_MODE_GETCONNECTOR  = _IOWR(_D, 0xA7, 80)   # sizeof = 80
+DRM_IOCTL_MODE_GETENCODER    = _IOWR(_D, 0xA6, 20)   # sizeof = 20
+DRM_IOCTL_MODE_SETCRTC       = _IOWR(_D, 0xA2, 104)  # sizeof = 104
+DRM_IOCTL_MODE_CREATE_DUMB   = _IOWR(_D, 0xB2, 32)
+DRM_IOCTL_MODE_MAP_DUMB      = _IOWR(_D, 0xB3, 24)
+DRM_IOCTL_MODE_DESTROY_DUMB  = _IOWR(_D, 0xB4, 4)
+DRM_IOCTL_MODE_ADDFB         = _IOWR(_D, 0xAE, 32)
+DRM_IOCTL_MODE_RMFB          = _IOWR(_D, 0xAF, 4)
 
-DRM_IOCTL_SET_MASTER          = _IO  (DRM_IOCTL_BASE, 0x1e)
-DRM_IOCTL_DROP_MASTER         = _IO  (DRM_IOCTL_BASE, 0x1f)
-DRM_IOCTL_SET_CLIENT_CAP      = _IOW (DRM_IOCTL_BASE, 0x0d, 16)
-DRM_IOCTL_MODE_GETRESOURCES   = _IOWR(DRM_IOCTL_BASE, 0xA0, 40)
-DRM_IOCTL_MODE_GETCONNECTOR   = _IOWR(DRM_IOCTL_BASE, 0xA7, 80)
-DRM_IOCTL_MODE_GETENCODER     = _IOWR(DRM_IOCTL_BASE, 0xA6, 16)
-DRM_IOCTL_MODE_SETCRTC        = _IOWR(DRM_IOCTL_BASE, 0xA2, 120)
-DRM_IOCTL_MODE_CREATE_DUMB    = _IOWR(DRM_IOCTL_BASE, 0xB2, 32)
-DRM_IOCTL_MODE_MAP_DUMB       = _IOWR(DRM_IOCTL_BASE, 0xB3, 24)
-DRM_IOCTL_MODE_DESTROY_DUMB   = _IOWR(DRM_IOCTL_BASE, 0xB4, 4)
-DRM_IOCTL_MODE_ADDFB          = _IOWR(DRM_IOCTL_BASE, 0xAE, 32)
-DRM_IOCTL_MODE_RMFB           = _IOWR(DRM_IOCTL_BASE, 0xAF, 4)
-
-# Client capabilities — must be set before querying resources on Pi/VC4
 DRM_CLIENT_CAP_UNIVERSAL_PLANES = 2
 DRM_CLIENT_CAP_ATOMIC           = 3
-
 DRM_MODE_CONNECTOR_CONNECTED    = 1
 
 
 # =============================================================================
-# ctypes structs
+# ctypes structs  (sizes verified against kernel uAPI headers)
 # =============================================================================
 
-class DrmSetClientCap(ctypes.Structure):
-    _fields_ = [
-        ("capability", ctypes.c_uint64),
-        ("value",      ctypes.c_uint64),
-    ]
+class SetClientCap(ctypes.Structure):       # 16 bytes
+    _fields_ = [("capability", ctypes.c_uint64),
+                ("value",      ctypes.c_uint64)]
 
-class DrmModeRes(ctypes.Structure):
-    _fields_ = [
-        ("fb_id_ptr",        ctypes.c_uint64),
-        ("crtc_id_ptr",      ctypes.c_uint64),
-        ("connector_id_ptr", ctypes.c_uint64),
-        ("encoder_id_ptr",   ctypes.c_uint64),
-        ("count_fbs",        ctypes.c_uint32),
-        ("count_crtcs",      ctypes.c_uint32),
-        ("count_connectors", ctypes.c_uint32),
-        ("count_encoders",   ctypes.c_uint32),
-        ("min_width",        ctypes.c_uint32),
-        ("max_width",        ctypes.c_uint32),
-        ("min_height",       ctypes.c_uint32),
-        ("max_height",       ctypes.c_uint32),
-    ]
+class ModeRes(ctypes.Structure):            # 64 bytes
+    _fields_ = [("fb_id_ptr",        ctypes.c_uint64),
+                ("crtc_id_ptr",      ctypes.c_uint64),
+                ("connector_id_ptr", ctypes.c_uint64),
+                ("encoder_id_ptr",   ctypes.c_uint64),
+                ("count_fbs",        ctypes.c_uint32),
+                ("count_crtcs",      ctypes.c_uint32),
+                ("count_connectors", ctypes.c_uint32),
+                ("count_encoders",   ctypes.c_uint32),
+                ("min_width",        ctypes.c_uint32),
+                ("max_width",        ctypes.c_uint32),
+                ("min_height",       ctypes.c_uint32),
+                ("max_height",       ctypes.c_uint32)]
 
-class DrmModeInfo(ctypes.Structure):
-    _fields_ = [
-        ("clock",       ctypes.c_uint32),
-        ("hdisplay",    ctypes.c_uint16),
-        ("hsync_start", ctypes.c_uint16),
-        ("hsync_end",   ctypes.c_uint16),
-        ("htotal",      ctypes.c_uint16),
-        ("hskew",       ctypes.c_uint16),
-        ("vdisplay",    ctypes.c_uint16),
-        ("vsync_start", ctypes.c_uint16),
-        ("vsync_end",   ctypes.c_uint16),
-        ("vtotal",      ctypes.c_uint16),
-        ("vscan",       ctypes.c_uint16),
-        ("vrefresh",    ctypes.c_uint32),
-        ("flags",       ctypes.c_uint32),
-        ("type",        ctypes.c_uint32),
-        ("name",        ctypes.c_char * 32),
-    ]
+class ModeInfo(ctypes.Structure):           # 68 bytes
+    _fields_ = [("clock",       ctypes.c_uint32),
+                ("hdisplay",    ctypes.c_uint16),
+                ("hsync_start", ctypes.c_uint16),
+                ("hsync_end",   ctypes.c_uint16),
+                ("htotal",      ctypes.c_uint16),
+                ("hskew",       ctypes.c_uint16),
+                ("vdisplay",    ctypes.c_uint16),
+                ("vsync_start", ctypes.c_uint16),
+                ("vsync_end",   ctypes.c_uint16),
+                ("vtotal",      ctypes.c_uint16),
+                ("vscan",       ctypes.c_uint16),
+                ("vrefresh",    ctypes.c_uint32),
+                ("flags",       ctypes.c_uint32),
+                ("type",        ctypes.c_uint32),
+                ("name",        ctypes.c_char * 32)]
 
-class DrmModeGetConnector(ctypes.Structure):
-    _fields_ = [
-        ("encoders_ptr",      ctypes.c_uint64),
-        ("modes_ptr",         ctypes.c_uint64),
-        ("props_ptr",         ctypes.c_uint64),
-        ("prop_values_ptr",   ctypes.c_uint64),
-        ("count_modes",       ctypes.c_uint32),
-        ("count_props",       ctypes.c_uint32),
-        ("count_encoders",    ctypes.c_uint32),
-        ("encoder_id",        ctypes.c_uint32),
-        ("connector_id",      ctypes.c_uint32),
-        ("connector_type",    ctypes.c_uint32),
-        ("connector_type_id", ctypes.c_uint32),
-        ("connection",        ctypes.c_uint32),
-        ("mm_width",          ctypes.c_uint32),
-        ("mm_height",         ctypes.c_uint32),
-        ("subpixel",          ctypes.c_uint32),
-        ("pad",               ctypes.c_uint32),
-    ]
+class GetConnector(ctypes.Structure):       # 80 bytes
+    _fields_ = [("encoders_ptr",      ctypes.c_uint64),
+                ("modes_ptr",         ctypes.c_uint64),
+                ("props_ptr",         ctypes.c_uint64),
+                ("prop_values_ptr",   ctypes.c_uint64),
+                ("count_modes",       ctypes.c_uint32),
+                ("count_props",       ctypes.c_uint32),
+                ("count_encoders",    ctypes.c_uint32),
+                ("encoder_id",        ctypes.c_uint32),
+                ("connector_id",      ctypes.c_uint32),
+                ("connector_type",    ctypes.c_uint32),
+                ("connector_type_id", ctypes.c_uint32),
+                ("connection",        ctypes.c_uint32),
+                ("mm_width",          ctypes.c_uint32),
+                ("mm_height",         ctypes.c_uint32),
+                ("subpixel",          ctypes.c_uint32),
+                ("pad",               ctypes.c_uint32)]
 
-class DrmModeGetEncoder(ctypes.Structure):
-    _fields_ = [
-        ("encoder_id",      ctypes.c_uint32),
-        ("encoder_type",    ctypes.c_uint32),
-        ("crtc_id",         ctypes.c_uint32),
-        ("possible_crtcs",  ctypes.c_uint32),
-        ("possible_clones", ctypes.c_uint32),
-    ]
+class GetEncoder(ctypes.Structure):         # 20 bytes
+    _fields_ = [("encoder_id",      ctypes.c_uint32),
+                ("encoder_type",    ctypes.c_uint32),
+                ("crtc_id",         ctypes.c_uint32),
+                ("possible_crtcs",  ctypes.c_uint32),
+                ("possible_clones", ctypes.c_uint32)]
 
-class DrmModeSetCrtc(ctypes.Structure):
-    _fields_ = [
-        ("set_connectors_ptr", ctypes.c_uint64),
-        ("count_connectors",   ctypes.c_uint32),
-        ("crtc_id",            ctypes.c_uint32),
-        ("fb_id",              ctypes.c_uint32),
-        ("x",                  ctypes.c_uint32),
-        ("y",                  ctypes.c_uint32),
-        ("gamma_size",         ctypes.c_uint32),
-        ("mode_valid",         ctypes.c_uint32),
-        ("mode",               DrmModeInfo),
-    ]
+class SetCrtc(ctypes.Structure):            # 104 bytes
+    _fields_ = [("set_connectors_ptr", ctypes.c_uint64),
+                ("count_connectors",   ctypes.c_uint32),
+                ("crtc_id",            ctypes.c_uint32),
+                ("fb_id",              ctypes.c_uint32),
+                ("x",                  ctypes.c_uint32),
+                ("y",                  ctypes.c_uint32),
+                ("gamma_size",         ctypes.c_uint32),
+                ("mode_valid",         ctypes.c_uint32),
+                ("mode",               ModeInfo)]
 
-class DrmModeCreateDumb(ctypes.Structure):
-    _fields_ = [
-        ("height", ctypes.c_uint32),
-        ("width",  ctypes.c_uint32),
-        ("bpp",    ctypes.c_uint32),
-        ("flags",  ctypes.c_uint32),
-        ("handle", ctypes.c_uint32),
-        ("pitch",  ctypes.c_uint32),
-        ("size",   ctypes.c_uint64),
-    ]
+class CreateDumb(ctypes.Structure):
+    _fields_ = [("height", ctypes.c_uint32), ("width",  ctypes.c_uint32),
+                ("bpp",    ctypes.c_uint32), ("flags",  ctypes.c_uint32),
+                ("handle", ctypes.c_uint32), ("pitch",  ctypes.c_uint32),
+                ("size",   ctypes.c_uint64)]
 
-class DrmModeMapDumb(ctypes.Structure):
-    _fields_ = [
-        ("handle", ctypes.c_uint32),
-        ("pad",    ctypes.c_uint32),
-        ("offset", ctypes.c_uint64),
-    ]
+class MapDumb(ctypes.Structure):
+    _fields_ = [("handle", ctypes.c_uint32), ("pad", ctypes.c_uint32),
+                ("offset", ctypes.c_uint64)]
 
-class DrmModeDestroyDumb(ctypes.Structure):
+class DestroyDumb(ctypes.Structure):
     _fields_ = [("handle", ctypes.c_uint32)]
 
-class DrmModeFbCmd(ctypes.Structure):
-    _fields_ = [
-        ("fb_id",  ctypes.c_uint32),
-        ("width",  ctypes.c_uint32),
-        ("height", ctypes.c_uint32),
-        ("pitch",  ctypes.c_uint32),
-        ("bpp",    ctypes.c_uint32),
-        ("depth",  ctypes.c_uint32),
-        ("handle", ctypes.c_uint32),
-    ]
+class AddFB(ctypes.Structure):
+    _fields_ = [("fb_id",  ctypes.c_uint32), ("width",  ctypes.c_uint32),
+                ("height", ctypes.c_uint32), ("pitch",  ctypes.c_uint32),
+                ("bpp",    ctypes.c_uint32), ("depth",  ctypes.c_uint32),
+                ("handle", ctypes.c_uint32)]
+
+class RmFB(ctypes.Structure):
+    _fields_ = [("fb_id", ctypes.c_uint32)]
 
 
 # =============================================================================
@@ -215,123 +185,145 @@ class DrmModeFbCmd(ctypes.Structure):
 
 class DRMDisplay:
     def __init__(self, device: str, connector_index: int = 0):
-        self.fd = os.open(device, os.O_RDWR | os.O_CLOEXEC)
+        self.fd     = os.open(device, os.O_RDWR | os.O_CLOEXEC)
         self.device = device
-        self.width = 0
+        self.width  = 0
         self.height = 0
-        self._mode = None
-        self._crtc_id = None
+        self._mode         = None
+        self._crtc_id      = None
         self._connector_id = None
         self._init(connector_index)
 
-    def _ioctl(self, request, arg):
-        return fcntl.ioctl(self.fd, request, arg)
+    # ── internal helpers ─────────────────────────────────────────────────────
+
+    def _ioctl(self, req, arg):
+        _ioctl(self.fd, req, arg)
 
     def _set_cap(self, cap, value):
-        s = DrmSetClientCap()
+        s = SetClientCap()
         s.capability = cap
-        s.value = value
+        s.value      = value
         try:
             self._ioctl(DRM_IOCTL_SET_CLIENT_CAP, s)
-        except OSError:
-            pass  # not fatal — driver may not support it
+            print(f"  client cap {cap}={value} OK", file=sys.stderr)
+        except OSError as e:
+            print(f"  client cap {cap}={value} failed: {e}", file=sys.stderr)
+
+    # ── init ─────────────────────────────────────────────────────────────────
 
     def _init(self, connector_index: int):
         # Acquire DRM master
+        master = SetClientCap()   # reuse struct just for _IO call with no arg
         try:
-            fcntl.ioctl(self.fd, DRM_IOCTL_SET_MASTER, 0)
+            _libc.ioctl(self.fd, DRM_IOCTL_SET_MASTER, 0)
+        except Exception:
+            pass
+        ret = _libc.ioctl(self.fd, DRM_IOCTL_SET_MASTER, 0)
+        # Non-zero means already master or no permission — check with a real call
+        import fcntl as _fcntl
+        try:
+            _fcntl.ioctl(self.fd, DRM_IOCTL_SET_MASTER, 0)
         except OSError as e:
-            raise RuntimeError(
-                f"Cannot acquire DRM master on {self.device}. "
-                "Run as root or add yourself to the 'video' group."
-            ) from e
+            if e.errno not in (0, 16):  # 16 = EBUSY (already master)
+                raise RuntimeError(
+                    f"Cannot acquire DRM master on {self.device}. "
+                    "Run as root or: sudo usermod -aG video,render $USER"
+                ) from e
 
-        # ── Tell the kernel we support universal planes ───────────────────────
-        # Required on Pi/VC4 before GETRESOURCES will return connectors.
+        # Set capabilities BEFORE querying resources — required on Pi/VC4
         self._set_cap(DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1)
         self._set_cap(DRM_CLIENT_CAP_ATOMIC, 1)
 
-        # ── Get resource IDs (two-step: counts then data) ────────────────────
-        res = DrmModeRes()
+        # ── Get resource counts ───────────────────────────────────────────────
+        res = ModeRes()
         self._ioctl(DRM_IOCTL_MODE_GETRESOURCES, res)
-
-        fb_arr        = (ctypes.c_uint32 * max(res.count_fbs,        1))()
-        crtc_arr      = (ctypes.c_uint32 * max(res.count_crtcs,      1))()
-        connector_arr = (ctypes.c_uint32 * max(res.count_connectors, 1))()
-        encoder_arr   = (ctypes.c_uint32 * max(res.count_encoders,   1))()
-
-        res.fb_id_ptr        = ctypes.addressof(fb_arr)
-        res.crtc_id_ptr      = ctypes.addressof(crtc_arr)
-        res.connector_id_ptr = ctypes.addressof(connector_arr)
-        res.encoder_id_ptr   = ctypes.addressof(encoder_arr)
-        self._ioctl(DRM_IOCTL_MODE_GETRESOURCES, res)
-
-        self._crtc_ids = list(crtc_arr)[:res.count_crtcs]
-
         print(f"DRM resources: {res.count_connectors} connectors, "
               f"{res.count_crtcs} crtcs, {res.count_encoders} encoders",
               file=sys.stderr)
 
+        # Allocate arrays for second call
+        n_fb   = max(res.count_fbs,        1)
+        n_crtc = max(res.count_crtcs,      1)
+        n_conn = max(res.count_connectors, 1)
+        n_enc  = max(res.count_encoders,   1)
+
+        fb_arr   = (ctypes.c_uint32 * n_fb)()
+        crtc_arr = (ctypes.c_uint32 * n_crtc)()
+        conn_arr = (ctypes.c_uint32 * n_conn)()
+        enc_arr  = (ctypes.c_uint32 * n_enc)()
+
+        res.fb_id_ptr        = ctypes.addressof(fb_arr)
+        res.crtc_id_ptr      = ctypes.addressof(crtc_arr)
+        res.connector_id_ptr = ctypes.addressof(conn_arr)
+        res.encoder_id_ptr   = ctypes.addressof(enc_arr)
+        self._ioctl(DRM_IOCTL_MODE_GETRESOURCES, res)
+
+        self._crtc_ids = list(crtc_arr)[:res.count_crtcs]
+
         # ── Find a connected connector ────────────────────────────────────────
         connected = []
-        for conn_id in list(connector_arr)[:res.count_connectors]:
-            info, modes, encoder_ids = self._get_connector(conn_id)
+        for conn_id in list(conn_arr)[:res.count_connectors]:
+            info, modes, enc_ids = self._get_connector(conn_id)
             if info.connection == DRM_MODE_CONNECTOR_CONNECTED and modes:
-                connected.append((conn_id, info, modes, encoder_ids))
+                connected.append((conn_id, info, modes, enc_ids))
 
         if not connected:
-            raise RuntimeError(f"No connected display found on {self.device}")
+            raise RuntimeError(
+                f"No connected display found on {self.device}\n"
+                "  Tip: check 'for f in /sys/class/drm/card1-*/status; do echo \"$f: $(cat $f)\"; done'"
+            )
 
         idx = min(connector_index, len(connected) - 1)
-        conn_id, conn_info, modes, encoder_ids = connected[idx]
-        print(f"Connector #{idx} id={conn_id} type={conn_info.connector_type}",
-              file=sys.stderr)
+        conn_id, conn_info, modes, enc_ids = connected[idx]
+        print(f"Connector #{idx} id={conn_id}", file=sys.stderr)
 
         mode = modes[0]
-        self.width  = mode.hdisplay
-        self.height = mode.vdisplay
-        self._mode  = mode
+        self.width         = mode.hdisplay
+        self.height        = mode.vdisplay
+        self._mode         = mode
         self._connector_id = conn_id
         print(f"Mode: {self.width}x{self.height}@{mode.vrefresh}Hz", file=sys.stderr)
 
-        self._crtc_id = self._find_crtc(conn_info, encoder_ids)
+        self._crtc_id = self._find_crtc(conn_info, enc_ids)
         if self._crtc_id is None:
             raise RuntimeError("No CRTC available for connector")
 
     def _get_connector(self, conn_id):
         # First call — get counts
-        info = DrmModeGetConnector()
+        info = GetConnector()
         info.connector_id = conn_id
         try:
             self._ioctl(DRM_IOCTL_MODE_GETCONNECTOR, info)
         except OSError:
             return info, [], []
 
-        print(f"  conn_id={conn_id} connection={info.connection} "
-              f"count_modes={info.count_modes} count_encoders={info.count_encoders}",
+        print(f"  conn {conn_id}: connection={info.connection} "
+              f"modes={info.count_modes} encoders={info.count_encoders}",
               file=sys.stderr)
 
         # Second call — fill arrays
-        modes_arr   = (DrmModeInfo     * max(info.count_modes,    1))()
-        encoder_arr = (ctypes.c_uint32 * max(info.count_encoders, 1))()
-        props_arr   = (ctypes.c_uint32 * max(info.count_props,    1))()
-        pvals_arr   = (ctypes.c_uint64 * max(info.count_props,    1))()
+        modes_a = (ModeInfo        * max(info.count_modes,    1))()
+        encs_a  = (ctypes.c_uint32 * max(info.count_encoders, 1))()
+        props_a = (ctypes.c_uint32 * max(info.count_props,    1))()
+        pvals_a = (ctypes.c_uint64 * max(info.count_props,    1))()
 
-        info.modes_ptr       = ctypes.addressof(modes_arr)
-        info.encoders_ptr    = ctypes.addressof(encoder_arr)
-        info.props_ptr       = ctypes.addressof(props_arr)
-        info.prop_values_ptr = ctypes.addressof(pvals_arr)
+        info.modes_ptr       = ctypes.addressof(modes_a)
+        info.encoders_ptr    = ctypes.addressof(encs_a)
+        info.props_ptr       = ctypes.addressof(props_a)
+        info.prop_values_ptr = ctypes.addressof(pvals_a)
 
         try:
             self._ioctl(DRM_IOCTL_MODE_GETCONNECTOR, info)
         except OSError:
             return info, [], []
 
-        return info, list(modes_arr)[:info.count_modes], list(encoder_arr)[:info.count_encoders]
+        return (info,
+                list(modes_a)[:info.count_modes],
+                list(encs_a)[:info.count_encoders])
 
-    def _find_crtc(self, conn_info, encoder_ids):
+    def _find_crtc(self, conn_info, enc_ids):
         if conn_info.encoder_id:
-            enc = DrmModeGetEncoder()
+            enc = GetEncoder()
             enc.encoder_id = conn_info.encoder_id
             try:
                 self._ioctl(DRM_IOCTL_MODE_GETENCODER, enc)
@@ -340,23 +332,23 @@ class DRMDisplay:
             except OSError:
                 pass
 
-        for enc_id in encoder_ids:
-            enc = DrmModeGetEncoder()
+        for enc_id in enc_ids:
+            enc = GetEncoder()
             enc.encoder_id = enc_id
             try:
                 self._ioctl(DRM_IOCTL_MODE_GETENCODER, enc)
             except OSError:
                 continue
-            possible = enc.possible_crtcs
             for i, crtc_id in enumerate(self._crtc_ids):
-                if possible & (1 << i):
+                if enc.possible_crtcs & (1 << i):
                     return crtc_id
         return None
 
-    def present(self, rgba_bytes: bytes, src_w: int, src_h: int, position: str):
-        """Blit an RGBA frame to the display at native resolution."""
+    # ── frame display ─────────────────────────────────────────────────────────
 
-        create = DrmModeCreateDumb()
+    def present(self, rgba_bytes: bytes, src_w: int, src_h: int, position: str):
+        # Create dumb buffer
+        create        = CreateDumb()
         create.width  = self.width
         create.height = self.height
         create.bpp    = 32
@@ -367,35 +359,37 @@ class DRMDisplay:
         size   = create.size
 
         try:
-            map_dumb = DrmModeMapDumb()
-            map_dumb.handle = handle
-            self._ioctl(DRM_IOCTL_MODE_MAP_DUMB, map_dumb)
+            # Map it
+            md        = MapDumb()
+            md.handle = handle
+            self._ioctl(DRM_IOCTL_MODE_MAP_DUMB, md)
 
-            with mmap.mmap(self.fd, size, offset=map_dumb.offset) as buf:
+            with mmap.mmap(self.fd, size, offset=md.offset) as buf:
                 buf.seek(0)
-                buf.write(b'\x00' * size)
+                buf.write(b'\x00' * size)   # black background
 
-                off_x, off_y = _compute_offset(src_w, src_h, self.width, self.height, position)
+                off_x, off_y = _offset(src_w, src_h, self.width, self.height, position)
                 copy_w = min(src_w, self.width  - off_x)
                 copy_h = min(src_h, self.height - off_y)
-                src_stride = src_w * 4
+                stride = src_w * 4
 
                 for row in range(copy_h):
-                    dst_offset = (off_y + row) * pitch + off_x * 4
-                    src_offset = row * src_stride
-                    row_rgba   = rgba_bytes[src_offset : src_offset + copy_w * 4]
+                    src_off = row * stride
+                    dst_off = (off_y + row) * pitch + off_x * 4
+                    row_rgba = rgba_bytes[src_off : src_off + copy_w * 4]
 
-                    # RGBA → XRGB8888 (B G R X in memory)
-                    bgrx = bytearray(copy_w * 4)
-                    bgrx[0::4] = row_rgba[2::4]  # B ← R
-                    bgrx[1::4] = row_rgba[1::4]  # G
-                    bgrx[2::4] = row_rgba[0::4]  # R ← B
-                    bgrx[3::4] = b'\x00' * copy_w
+                    # RGBA → XRGB8888  (stored as B G R X in memory)
+                    bgrx        = bytearray(copy_w * 4)
+                    bgrx[0::4]  = row_rgba[2::4]   # B ← R
+                    bgrx[1::4]  = row_rgba[1::4]   # G
+                    bgrx[2::4]  = row_rgba[0::4]   # R ← B
+                    bgrx[3::4]  = b'\x00' * copy_w
 
-                    buf.seek(dst_offset)
+                    buf.seek(dst_off)
                     buf.write(bytes(bgrx))
 
-            fb = DrmModeFbCmd()
+            # Attach framebuffer
+            fb        = AddFB()
             fb.width  = self.width
             fb.height = self.height
             fb.pitch  = pitch
@@ -403,128 +397,90 @@ class DRMDisplay:
             fb.depth  = 24
             fb.handle = handle
             self._ioctl(DRM_IOCTL_MODE_ADDFB, fb)
-            fb_id = fb.fb_id
 
             try:
                 conn_arr = (ctypes.c_uint32 * 1)(self._connector_id)
-                set_crtc = DrmModeSetCrtc()
-                set_crtc.crtc_id            = self._crtc_id
-                set_crtc.fb_id              = fb_id
-                set_crtc.x                  = 0
-                set_crtc.y                  = 0
-                set_crtc.set_connectors_ptr = ctypes.addressof(conn_arr)
-                set_crtc.count_connectors   = 1
-                set_crtc.mode_valid         = 1
-                set_crtc.mode               = self._mode
-                self._ioctl(DRM_IOCTL_MODE_SETCRTC, set_crtc)
+                sc = SetCrtc()
+                sc.crtc_id            = self._crtc_id
+                sc.fb_id              = fb.fb_id
+                sc.x                  = 0
+                sc.y                  = 0
+                sc.set_connectors_ptr = ctypes.addressof(conn_arr)
+                sc.count_connectors   = 1
+                sc.mode_valid         = 1
+                sc.mode               = self._mode
+                self._ioctl(DRM_IOCTL_MODE_SETCRTC, sc)
             finally:
-                try:
-                    self._ioctl(DRM_IOCTL_MODE_RMFB, ctypes.c_uint32(fb_id))
-                except OSError:
-                    pass
+                rm = RmFB()
+                rm.fb_id = fb.fb_id
+                try: self._ioctl(DRM_IOCTL_MODE_RMFB, rm)
+                except OSError: pass
         finally:
-            destroy = DrmModeDestroyDumb()
-            destroy.handle = handle
-            try:
-                self._ioctl(DRM_IOCTL_MODE_DESTROY_DUMB, destroy)
-            except OSError:
-                pass
+            dd = DestroyDumb()
+            dd.handle = handle
+            try: self._ioctl(DRM_IOCTL_MODE_DESTROY_DUMB, dd)
+            except OSError: pass
 
     def close(self):
-        try:
-            fcntl.ioctl(self.fd, DRM_IOCTL_DROP_MASTER, 0)
-        except OSError:
-            pass
+        import fcntl as _fcntl
+        try: _fcntl.ioctl(self.fd, DRM_IOCTL_DROP_MASTER, 0)
+        except OSError: pass
         os.close(self.fd)
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        self.close()
+    def __enter__(self):  return self
+    def __exit__(self, *_): self.close()
 
 
-def _compute_offset(src_w, src_h, disp_w, disp_h, position):
-    if position == "center":
-        ox = (disp_w - src_w) // 2 if src_w < disp_w else 0
-        oy = (disp_h - src_h) // 2 if src_h < disp_h else 0
-        return ox, oy
+def _offset(sw, sh, dw, dh, pos):
+    if pos == "center":
+        return ((dw-sw)//2 if sw < dw else 0,
+                (dh-sh)//2 if sh < dh else 0)
     return 0, 0
 
 
 # =============================================================================
-# Image playback
+# Image
 # =============================================================================
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp"}
+IMAGE_EXTS = {".jpg",".jpeg",".png",".gif",".bmp",".tiff",".tif",".webp"}
 
-def is_image(path: Path) -> bool:
-    return path.suffix.lower() in IMAGE_EXTS
-
-def play_image(display: DRMDisplay, path: Path, duration: float, position: str):
+def play_image(display, path, duration, position):
     print(f"Image: {path}", file=sys.stderr)
-    img = Image.open(path).convert("RGBA")
+    img  = Image.open(path).convert("RGBA")
     display.present(img.tobytes(), img.width, img.height, position)
     time.sleep(duration)
 
 
 # =============================================================================
-# Video playback
+# Video
 # =============================================================================
 
-def play_video(display: DRMDisplay, path: Path, position: str):
+def play_video(display, path, position):
     print(f"Video: {path}", file=sys.stderr)
-
     container = av.open(str(path))
     stream = next((s for s in container.streams if s.type == "video"), None)
-    if stream is None:
-        print(f"  No video stream in {path}, skipping", file=sys.stderr)
+    if not stream:
+        print(f"  No video stream, skipping", file=sys.stderr)
         return
 
     for s in container.streams:
         if s.type == "audio":
             s.discard = "all"
 
-    if stream.average_rate and float(stream.average_rate) > 0:
-        frame_duration = 1.0 / float(stream.average_rate)
-    elif stream.guessed_rate and float(stream.guessed_rate) > 0:
-        frame_duration = 1.0 / float(stream.guessed_rate)
-    else:
-        frame_duration = 1 / 30
-
-    print(f"  {stream.width}x{stream.height} @ ~{1/frame_duration:.2f}fps", file=sys.stderr)
+    fps = float(stream.average_rate or stream.guessed_rate or 30)
+    frame_dur = 1.0 / fps if fps > 0 else 1/30
+    print(f"  {stream.width}x{stream.height} @ ~{fps:.2f}fps", file=sys.stderr)
 
     for packet in container.demux(stream):
         for frame in packet.decode():
             t0 = time.monotonic()
-            rgba_frame = frame.reformat(format="rgba")
-            rgba_bytes = rgba_frame.planes[0].to_bytes()
-            display.present(rgba_bytes, rgba_frame.width, rgba_frame.height, position)
-            remaining = frame_duration - (time.monotonic() - t0)
+            f  = frame.reformat(format="rgba")
+            display.present(f.planes[0].to_bytes(), f.width, f.height, position)
+            remaining = frame_dur - (time.monotonic() - t0)
             if remaining > 0:
                 time.sleep(remaining)
 
     container.close()
-
-
-# =============================================================================
-# Config
-# =============================================================================
-
-def load_config(path: str) -> dict:
-    with open(path, "rb") as f:
-        return tomllib.load(f)
-
-def validate_config(cfg: dict) -> None:
-    if "display" not in cfg:
-        raise ValueError("Config missing [display] section")
-    if "playlist" not in cfg:
-        raise ValueError("Config missing [playlist] section")
-    if "items" not in cfg["playlist"]:
-        raise ValueError("Config missing [[playlist.items]]")
-    pos = cfg["display"].get("position", "top_left")
-    if pos not in ("center", "top_left"):
-        print(f"Warning: unknown position '{pos}', using 'top_left'", file=sys.stderr)
 
 
 # =============================================================================
@@ -533,38 +489,36 @@ def validate_config(cfg: dict) -> None:
 
 def main():
     config_path = sys.argv[1] if len(sys.argv) > 1 else "playlist.toml"
-    print(f"drm-player — config: {config_path}", file=sys.stderr)
+    print(f"drm-player — {config_path}", file=sys.stderr)
 
     try:
-        cfg = load_config(config_path)
+        with open(config_path, "rb") as f:
+            cfg = tomllib.load(f)
     except FileNotFoundError:
-        print(f"Error: config file not found: {config_path}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(f"Config not found: {config_path}")
     except Exception as e:
-        print(f"Error reading config: {e}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(f"Config error: {e}")
 
-    validate_config(cfg)
+    dcfg     = cfg.get("display", {})
+    device   = dcfg.get("device",          "/dev/dri/card1")
+    position = dcfg.get("position",        "top_left")
+    conn_idx = dcfg.get("connector_index", 0)
+    items    = cfg.get("playlist", {}).get("items", [])
 
-    display_cfg = cfg["display"]
-    device      = display_cfg.get("device", "/dev/dri/card1")
-    position    = display_cfg.get("position", "top_left")
-    conn_index  = display_cfg.get("connector_index", 0)
-    items       = cfg["playlist"]["items"]
+    if position not in ("center", "top_left"):
+        print(f"Warning: unknown position '{position}', using 'top_left'", file=sys.stderr)
 
-    print(f"Initialising DRM on {device}…", file=sys.stderr)
-
+    print(f"Opening {device}…", file=sys.stderr)
     try:
-        with DRMDisplay(device, conn_index) as display:
+        with DRMDisplay(device, conn_idx) as display:
             print(f"Display ready: {display.width}x{display.height}", file=sys.stderr)
-
             for item in items:
                 path = Path(item["path"])
                 if not path.exists():
                     print(f"Skipping (not found): {path}", file=sys.stderr)
                     continue
                 try:
-                    if is_image(path):
+                    if path.suffix.lower() in IMAGE_EXTS:
                         play_image(display, path, float(item.get("duration", 5.0)), position)
                     else:
                         play_video(display, path, position)
@@ -574,16 +528,12 @@ def main():
                 except Exception as e:
                     print(f"Error playing {path}: {e}", file=sys.stderr)
                     traceback.print_exc()
-                    continue
-
     except RuntimeError as e:
-        print(f"Display error: {e}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(f"Display error: {e}")
     except KeyboardInterrupt:
         print("\nExiting.", file=sys.stderr)
 
-    print("Playlist complete.", file=sys.stderr)
-
+    print("Done.", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
