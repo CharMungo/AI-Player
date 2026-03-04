@@ -508,9 +508,13 @@ def play_video(display: DRMDisplay, path: Path, position: str):
     # - pad the video to display size with black, placed at off_x/off_y
     # - output format: bgr0 (= XRGB8888, no conversion needed in Python)
     # - no audio (-an)
-    vf = f"pad={dw}:{dh}:{off_x}:{off_y}:black"
+    needs_pad = (src_w != dw or src_h != dh)
 
-    # Try hardware decoder for h264/hevc, fall back to software
+    # Try hardware decoder for h264/hevc, fall back to software.
+    # Hardware decoders output frames in a hardware pixel format which
+    # cannot be fed directly into software filters like pad=.
+    # When padding is needed we must insert format=yuv420p first to
+    # pull the frame back into a software-accessible format.
     codec = None
     ext = path.suffix.lower()
     hw_decoders = _hw_decoders()
@@ -519,47 +523,70 @@ def play_video(display: DRMDisplay, path: Path, position: str):
     elif "hevc_v4l2m2m" in hw_decoders and ext in (".mp4", ".mkv"):
         codec = "hevc_v4l2m2m"
 
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
+    # Build filter chain
+    if needs_pad:
+        if codec:
+            # format=yuv420p downloads from hw surface before pad filter
+            vf = f"format=yuv420p,pad={dw}:{dh}:{off_x}:{off_y}:black"
+        else:
+            vf = f"pad={dw}:{dh}:{off_x}:{off_y}:black"
+    else:
+        vf = None   # no filter needed — content is already display-sized
+
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
     if codec:
         cmd += ["-c:v", codec]
-    cmd += [
-        "-i", str(path),
-        "-an",                        # no audio
-        "-f", "rawvideo",             # raw output
-        "-pix_fmt", "bgr0",           # B G R 0 = XRGB8888, no Python conversion
-        "-vf", vf,                    # pad to display size + position
-        "-threads", "0",              # use all CPU cores for decoding
-        "pipe:1",                     # output to stdout
-    ]
+    cmd += ["-i", str(path), "-an", "-f", "rawvideo", "-pix_fmt", "bgr0",
+            "-threads", "0"]
+    if vf:
+        cmd += ["-vf", vf]
+    cmd += ["pipe:1"]
 
-    print(f"  cmd: {' '.join(cmd)}", file=sys.stderr)
+    def _run_ffmpeg(cmd, frame_size, display, frame_dur):
+        """Run an ffmpeg command, pipe frames to display. Returns frame count."""
+        print(f"  cmd: {' '.join(cmd)}", file=sys.stderr)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        count = 0
+        try:
+            while True:
+                t0 = time.monotonic()
+                data = proc.stdout.read(frame_size)
+                if len(data) < frame_size:
+                    break
+                display.present_bgr0(data)
+                count += 1
+                remaining = frame_dur - (time.monotonic() - t0)
+                if remaining > 0:
+                    time.sleep(remaining)
+        except KeyboardInterrupt:
+            raise
+        finally:
+            proc.stdout.close()
+            # Drain stderr so the process can exit cleanly
+            stderr_out = proc.stderr.read().decode(errors="replace")
+            proc.terminate()
+            proc.wait()
+            if count == 0 and stderr_out.strip():
+                print(f"  ffmpeg stderr: {stderr_out.strip()}", file=sys.stderr)
+        return count
 
-    frame_size = dw * dh * 4   # bytes per frame (bgr0, 4 bytes/pixel)
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    frame_size = dw * dh * 4
 
-    try:
-        while True:
-            t0 = time.monotonic()
+    # Try the primary command (may use hw decoder)
+    count = _run_ffmpeg(cmd, frame_size, display, frame_dur)
 
-            # Read exactly one frame from ffmpeg
-            data = proc.stdout.read(frame_size)
-            if len(data) < frame_size:
-                break  # EOF or error
-
-            # Upload directly to DRM — no conversion, no GIL contention
-            display.present_bgr0(data)
-
-            # Pace to video FPS
-            remaining = frame_dur - (time.monotonic() - t0)
-            if remaining > 0:
-                time.sleep(remaining)
-
-    except KeyboardInterrupt:
-        raise
-    finally:
-        proc.stdout.close()
-        proc.terminate()
-        proc.wait()
+    # If hw decoder produced nothing, retry with pure software decoding
+    if count == 0 and codec is not None:
+        print("  Hardware decoder produced no frames — retrying with software decoding",
+              file=sys.stderr)
+        sw_vf = f"pad={dw}:{dh}:{off_x}:{off_y}:black" if needs_pad else None
+        sw_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                  "-i", str(path), "-an", "-f", "rawvideo",
+                  "-pix_fmt", "bgr0", "-threads", "0"]
+        if sw_vf:
+            sw_cmd += ["-vf", sw_vf]
+        sw_cmd += ["pipe:1"]
+        _run_ffmpeg(sw_cmd, frame_size, display, frame_dur)
 
 
 # =============================================================================
