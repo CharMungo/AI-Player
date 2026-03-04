@@ -5,14 +5,15 @@ drm-player — DRM/KMS media player for Linux without a window manager.
 Usage:  python3 drm_player.py [playlist.toml]
 
 Requirements (Raspberry Pi OS / Debian):
-    sudo apt install python3-pillow ffmpeg
+    sudo apt install python3-pillow python3-numpy ffmpeg
     pip3 install av
 
 Requirements (Arch):
-    sudo pacman -S python-pillow python-pyav ffmpeg
+    sudo pacman -S python-pillow python-numpy python-pyav ffmpeg
 """
 
 import sys, os, time, ctypes, mmap, traceback
+import threading, queue
 from pathlib import Path
 
 # ── TOML ─────────────────────────────────────────────────────────────────────
@@ -32,6 +33,12 @@ try:
     from PIL import Image
 except ImportError:
     sys.exit("Install Pillow:  sudo apt install python3-pillow")
+
+# ── numpy ────────────────────────────────────────────────────────────────────
+try:
+    import numpy as np
+except ImportError:
+    sys.exit("Install numpy:  sudo apt install python3-numpy")
 
 # ── PyAV ─────────────────────────────────────────────────────────────────────
 try:
@@ -85,8 +92,7 @@ DRM_MODE_CONNECTOR_CONNECTED    = 1
 # =============================================================================
 
 class SetClientCap(ctypes.Structure):
-    _fields_ = [("capability", ctypes.c_uint64),
-                ("value",      ctypes.c_uint64)]
+    _fields_ = [("capability", ctypes.c_uint64), ("value", ctypes.c_uint64)]
 
 class ModeRes(ctypes.Structure):
     _fields_ = [("fb_id_ptr",        ctypes.c_uint64),
@@ -179,6 +185,48 @@ class RmFB(ctypes.Structure):
 
 
 # =============================================================================
+# Pixel conversion  (numpy — vectorised, releases GIL, uses all cores)
+# =============================================================================
+
+def rgba_to_bgrx(rgba: np.ndarray, dst_w: int, dst_h: int,
+                 src_w: int, src_h: int,
+                 off_x: int, off_y: int, pitch: int) -> bytes:
+    """
+    Convert an RGBA numpy array to a full-display-size XRGB8888 buffer.
+    All heavy lifting is done in numpy (C speed, GIL released).
+    Returns raw bytes ready to write into the dumb buffer.
+    """
+    # Output buffer: dst_h rows × pitch bytes, zero-filled (black)
+    out = np.zeros((dst_h, pitch), dtype=np.uint8)
+
+    copy_w = min(src_w, dst_w - off_x)
+    copy_h = min(src_h, dst_h - off_y)
+
+    # Slice the destination region
+    dst_region = out[off_y : off_y + copy_h,
+                     off_x * 4 : off_x * 4 + copy_w * 4]
+
+    # Slice the source (handle oversized content)
+    src_region = rgba[:copy_h, :copy_w, :]  # (copy_h, copy_w, 4)
+
+    # Reshape destination to (copy_h, copy_w, 4) for channel assignment
+    dst_pix = dst_region.reshape(copy_h, copy_w, 4)
+
+    # RGBA → BGRX  (XRGB8888 stored little-endian = B G R X in memory)
+    dst_pix[:, :, 0] = src_region[:, :, 2]  # B ← R
+    dst_pix[:, :, 1] = src_region[:, :, 1]  # G
+    dst_pix[:, :, 2] = src_region[:, :, 0]  # R ← B
+    dst_pix[:, :, 3] = 0                     # X
+
+    return out.tobytes()
+
+
+def frame_to_rgba_array(rgba_bytes: bytes, w: int, h: int) -> np.ndarray:
+    """Wrap raw RGBA bytes as a numpy array (zero-copy view)."""
+    return np.frombuffer(rgba_bytes, dtype=np.uint8).reshape(h, w, 4)
+
+
+# =============================================================================
 # DRM Display
 # =============================================================================
 
@@ -191,10 +239,8 @@ class DRMDisplay:
         self._mode         = None
         self._crtc_id      = None
         self._connector_id = None
-        # Track the currently displayed fb and dumb buffer so we can free
-        # them only when replaced — keeps the image on screen between frames.
-        self._current_fb     = None   # fb_id (int)
-        self._current_handle = None   # dumb buffer handle (int)
+        self._current_fb     = None
+        self._current_handle = None
         self._init(connector_index)
 
     def _ioctl(self, req, arg):
@@ -220,7 +266,6 @@ class DRMDisplay:
                     "Run as root or: sudo usermod -aG video,render $USER"
                 ) from e
 
-        # Must set these caps before GETRESOURCES on Pi/VC4
         self._set_cap(DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1)
         self._set_cap(DRM_CLIENT_CAP_ATOMIC, 1)
 
@@ -320,14 +365,12 @@ class DRMDisplay:
         return None
 
     def _free_current(self):
-        """Release the previously displayed framebuffer and dumb buffer."""
         if self._current_fb is not None:
             rm = RmFB()
             rm.fb_id = self._current_fb
             try: self._ioctl(DRM_IOCTL_MODE_RMFB, rm)
             except OSError: pass
             self._current_fb = None
-
         if self._current_handle is not None:
             dd = DestroyDumb()
             dd.handle = self._current_handle
@@ -335,13 +378,12 @@ class DRMDisplay:
             except OSError: pass
             self._current_handle = None
 
-    def present(self, rgba_bytes: bytes, src_w: int, src_h: int, position: str):
+    def present_raw(self, bgrx_bytes: bytes):
         """
-        Blit RGBA pixels onto a new dumb buffer, flip to it, then release
-        the *previous* buffer.  This keeps the image visible until the next
-        call to present() — no more black flashes.
+        Upload a pre-converted BGRX buffer (full display size) and flip to it.
+        Pixel conversion should already be done (off the main thread) before
+        calling this.
         """
-        # Build new dumb buffer
         create        = CreateDumb()
         create.width  = self.width
         create.height = self.height
@@ -352,35 +394,14 @@ class DRMDisplay:
         pitch      = create.pitch
         size       = create.size
 
-        # Map and fill
         md        = MapDumb()
         md.handle = new_handle
         self._ioctl(DRM_IOCTL_MODE_MAP_DUMB, md)
 
         with mmap.mmap(self.fd, size, offset=md.offset) as buf:
             buf.seek(0)
-            buf.write(b'\x00' * size)
+            buf.write(bgrx_bytes[:size])
 
-            off_x, off_y = _offset(src_w, src_h, self.width, self.height, position)
-            copy_w = min(src_w, self.width  - off_x)
-            copy_h = min(src_h, self.height - off_y)
-            stride = src_w * 4
-
-            for row in range(copy_h):
-                src_off  = row * stride
-                dst_off  = (off_y + row) * pitch + off_x * 4
-                row_rgba = rgba_bytes[src_off : src_off + copy_w * 4]
-
-                bgrx       = bytearray(copy_w * 4)
-                bgrx[0::4] = row_rgba[2::4]   # B ← R
-                bgrx[1::4] = row_rgba[1::4]   # G
-                bgrx[2::4] = row_rgba[0::4]   # R ← B
-                bgrx[3::4] = b'\x00' * copy_w
-
-                buf.seek(dst_off)
-                buf.write(bytes(bgrx))
-
-        # Attach new framebuffer
         fb        = AddFB()
         fb.width  = self.width
         fb.height = self.height
@@ -391,7 +412,6 @@ class DRMDisplay:
         self._ioctl(DRM_IOCTL_MODE_ADDFB, fb)
         new_fb_id = fb.fb_id
 
-        # Flip to new framebuffer
         conn_arr = (ctypes.c_uint32 * 1)(self._connector_id)
         sc = SetCrtc()
         sc.crtc_id            = self._crtc_id
@@ -404,12 +424,24 @@ class DRMDisplay:
         sc.mode               = self._mode
         self._ioctl(DRM_IOCTL_MODE_SETCRTC, sc)
 
-        # NOW it's safe to free the old buffer — the display is scanning the new one
+        # Free old buffer now that display is scanning the new one
         self._free_current()
-
-        # Remember new buffer so we can free it on the next frame
         self._current_fb     = new_fb_id
         self._current_handle = new_handle
+
+    def present(self, rgba_bytes: bytes, src_w: int, src_h: int, position: str):
+        """Convert RGBA→BGRX (numpy) then upload. Used for images."""
+        off_x, off_y = _offset(src_w, src_h, self.width, self.height, position)
+
+        # Get pitch by creating a temporary dumb buffer just to read pitch,
+        # then immediately reuse it. Simpler: just compute pitch as width*4
+        # (always true for 32bpp with no special alignment on Pi).
+        pitch = self.width * 4
+
+        rgba_arr = frame_to_rgba_array(rgba_bytes, src_w, src_h)
+        bgrx = rgba_to_bgrx(rgba_arr, self.width, self.height,
+                             src_w, src_h, off_x, off_y, pitch)
+        self.present_raw(bgrx)
 
     def close(self):
         self._free_current()
@@ -435,23 +467,82 @@ def _offset(sw, sh, dw, dh, pos):
 
 IMAGE_EXTS = {".jpg",".jpeg",".png",".gif",".bmp",".tiff",".tif",".webp"}
 
-def play_image(display, path, duration, position):
+def play_image(display: DRMDisplay, path: Path, duration: float, position: str):
     print(f"Image: {path}", file=sys.stderr)
     img = Image.open(path).convert("RGBA")
     display.present(img.tobytes(), img.width, img.height, position)
-    time.sleep(duration)   # buffer stays alive — image stays on screen
+    time.sleep(duration)
 
 
 # =============================================================================
-# Video
+# Video  — pipelined decode + display across two cores
+#
+#  Thread A (decoder):  PyAV decode → numpy pixel conversion → queue
+#  Thread B (main):     queue → dumb buffer upload → set_crtc → pace to FPS
+#
+#  PyAV decode and numpy both release the GIL, so they genuinely run
+#  on separate cores despite Python's GIL.
 # =============================================================================
 
-def play_video(display, path, position):
+_SENTINEL = None   # signals decoder thread to stop
+_QUEUE_DEPTH = 4   # how many pre-converted frames to buffer
+
+
+def _decoder_thread(container, stream, display_w, display_h,
+                    position: str, out_q: queue.Queue, stop_evt: threading.Event):
+    """
+    Runs on a background thread.
+    Decodes frames, converts RGBA→BGRX with numpy, pushes bytes into out_q.
+    """
+    pitch = display_w * 4
+    try:
+        for packet in container.demux(stream):
+            if stop_evt.is_set():
+                break
+            for frame in packet.decode():
+                if stop_evt.is_set():
+                    break
+
+                # Reformat to RGBA — PyAV releases GIL during decode
+                f = frame.reformat(format="rgba")
+                src_w = f.width
+                src_h = f.height
+
+                # numpy pixel conversion — also releases GIL
+                rgba_arr = np.frombuffer(bytes(f.planes[0]),
+                                         dtype=np.uint8).reshape(src_h, src_w, 4)
+                off_x, off_y = _offset(src_w, src_h, display_w, display_h, position)
+                bgrx = rgba_to_bgrx(rgba_arr, display_w, display_h,
+                                    src_w, src_h, off_x, off_y, pitch)
+
+                # Block if the display thread is falling behind
+                # (avoids unbounded memory use)
+                while not stop_evt.is_set():
+                    try:
+                        out_q.put(bgrx, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+
+    except Exception as e:
+        print(f"  Decoder error: {e}", file=sys.stderr)
+        traceback.print_exc()
+    finally:
+        try:
+            out_q.put(_SENTINEL, timeout=1.0)
+        except queue.Full:
+            pass
+        container.close()
+
+
+def play_video(display: DRMDisplay, path: Path, position: str):
     print(f"Video: {path}", file=sys.stderr)
+
     container = av.open(str(path))
     stream = next((s for s in container.streams if s.type == "video"), None)
     if not stream:
         print("  No video stream, skipping", file=sys.stderr)
+        container.close()
         return
 
     for s in container.streams:
@@ -460,18 +551,47 @@ def play_video(display, path, position):
 
     fps = float(stream.average_rate or stream.guessed_rate or 30)
     frame_dur = 1.0 / fps if fps > 0 else 1/30
-    print(f"  {stream.width}x{stream.height} @ ~{fps:.2f}fps", file=sys.stderr)
+    print(f"  {stream.width}x{stream.height} @ ~{fps:.2f}fps  "
+          f"(pipeline depth={_QUEUE_DEPTH})", file=sys.stderr)
 
-    for packet in container.demux(stream):
-        for frame in packet.decode():
+    frame_q  = queue.Queue(maxsize=_QUEUE_DEPTH)
+    stop_evt = threading.Event()
+
+    # Start decoder on a background thread
+    decoder = threading.Thread(
+        target=_decoder_thread,
+        args=(container, stream, display.width, display.height,
+              position, frame_q, stop_evt),
+        daemon=True,
+    )
+    decoder.start()
+
+    try:
+        while True:
             t0 = time.monotonic()
-            f  = frame.reformat(format="rgba")
-            display.present(bytes(f.planes[0]), f.width, f.height, position)
+
+            try:
+                bgrx = frame_q.get(timeout=5.0)
+            except queue.Empty:
+                print("  Decoder stalled — stopping", file=sys.stderr)
+                break
+
+            if bgrx is _SENTINEL:
+                break
+
+            # Upload + flip (main thread, holds DRM fd)
+            display.present_raw(bgrx)
+
+            # Pace playback to video FPS
             remaining = frame_dur - (time.monotonic() - t0)
             if remaining > 0:
                 time.sleep(remaining)
 
-    container.close()
+    except KeyboardInterrupt:
+        raise
+    finally:
+        stop_evt.set()
+        decoder.join(timeout=3.0)
 
 
 # =============================================================================
