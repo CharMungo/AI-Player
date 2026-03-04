@@ -39,13 +39,12 @@ try:
 except ImportError:
     sys.exit("Install PyAV:  pip3 install av")
 
-# ── libc ioctl (avoids fcntl.ioctl buffer-protocol issues with ctypes) ───────
+# ── libc ioctl ────────────────────────────────────────────────────────────────
 _libc = ctypes.CDLL("libc.so.6", use_errno=True)
 _libc.ioctl.restype  = ctypes.c_int
 _libc.ioctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p]
 
 def _ioctl(fd: int, request: int, arg) -> None:
-    """Call ioctl passing a direct C pointer to a ctypes struct."""
     ret = _libc.ioctl(fd, request, ctypes.addressof(arg))
     if ret != 0:
         err = ctypes.get_errno()
@@ -66,10 +65,10 @@ _D = ord('d')
 DRM_IOCTL_SET_MASTER         = _IO  (_D, 0x1e)
 DRM_IOCTL_DROP_MASTER        = _IO  (_D, 0x1f)
 DRM_IOCTL_SET_CLIENT_CAP     = _IOW (_D, 0x0d, 16)
-DRM_IOCTL_MODE_GETRESOURCES  = _IOWR(_D, 0xA0, 64)   # sizeof = 64
-DRM_IOCTL_MODE_GETCONNECTOR  = _IOWR(_D, 0xA7, 80)   # sizeof = 80
-DRM_IOCTL_MODE_GETENCODER    = _IOWR(_D, 0xA6, 20)   # sizeof = 20
-DRM_IOCTL_MODE_SETCRTC       = _IOWR(_D, 0xA2, 104)  # sizeof = 104
+DRM_IOCTL_MODE_GETRESOURCES  = _IOWR(_D, 0xA0, 64)
+DRM_IOCTL_MODE_GETCONNECTOR  = _IOWR(_D, 0xA7, 80)
+DRM_IOCTL_MODE_GETENCODER    = _IOWR(_D, 0xA6, 20)
+DRM_IOCTL_MODE_SETCRTC       = _IOWR(_D, 0xA2, 104)
 DRM_IOCTL_MODE_CREATE_DUMB   = _IOWR(_D, 0xB2, 32)
 DRM_IOCTL_MODE_MAP_DUMB      = _IOWR(_D, 0xB3, 24)
 DRM_IOCTL_MODE_DESTROY_DUMB  = _IOWR(_D, 0xB4, 4)
@@ -82,14 +81,14 @@ DRM_MODE_CONNECTOR_CONNECTED    = 1
 
 
 # =============================================================================
-# ctypes structs  (sizes verified against kernel uAPI headers)
+# ctypes structs
 # =============================================================================
 
-class SetClientCap(ctypes.Structure):       # 16 bytes
+class SetClientCap(ctypes.Structure):
     _fields_ = [("capability", ctypes.c_uint64),
                 ("value",      ctypes.c_uint64)]
 
-class ModeRes(ctypes.Structure):            # 64 bytes
+class ModeRes(ctypes.Structure):
     _fields_ = [("fb_id_ptr",        ctypes.c_uint64),
                 ("crtc_id_ptr",      ctypes.c_uint64),
                 ("connector_id_ptr", ctypes.c_uint64),
@@ -103,7 +102,7 @@ class ModeRes(ctypes.Structure):            # 64 bytes
                 ("min_height",       ctypes.c_uint32),
                 ("max_height",       ctypes.c_uint32)]
 
-class ModeInfo(ctypes.Structure):           # 68 bytes
+class ModeInfo(ctypes.Structure):
     _fields_ = [("clock",       ctypes.c_uint32),
                 ("hdisplay",    ctypes.c_uint16),
                 ("hsync_start", ctypes.c_uint16),
@@ -120,7 +119,7 @@ class ModeInfo(ctypes.Structure):           # 68 bytes
                 ("type",        ctypes.c_uint32),
                 ("name",        ctypes.c_char * 32)]
 
-class GetConnector(ctypes.Structure):       # 80 bytes
+class GetConnector(ctypes.Structure):
     _fields_ = [("encoders_ptr",      ctypes.c_uint64),
                 ("modes_ptr",         ctypes.c_uint64),
                 ("props_ptr",         ctypes.c_uint64),
@@ -138,14 +137,14 @@ class GetConnector(ctypes.Structure):       # 80 bytes
                 ("subpixel",          ctypes.c_uint32),
                 ("pad",               ctypes.c_uint32)]
 
-class GetEncoder(ctypes.Structure):         # 20 bytes
+class GetEncoder(ctypes.Structure):
     _fields_ = [("encoder_id",      ctypes.c_uint32),
                 ("encoder_type",    ctypes.c_uint32),
                 ("crtc_id",         ctypes.c_uint32),
                 ("possible_crtcs",  ctypes.c_uint32),
                 ("possible_clones", ctypes.c_uint32)]
 
-class SetCrtc(ctypes.Structure):            # 104 bytes
+class SetCrtc(ctypes.Structure):
     _fields_ = [("set_connectors_ptr", ctypes.c_uint64),
                 ("count_connectors",   ctypes.c_uint32),
                 ("crtc_id",            ctypes.c_uint32),
@@ -192,9 +191,11 @@ class DRMDisplay:
         self._mode         = None
         self._crtc_id      = None
         self._connector_id = None
+        # Track the currently displayed fb and dumb buffer so we can free
+        # them only when replaced — keeps the image on screen between frames.
+        self._current_fb     = None   # fb_id (int)
+        self._current_handle = None   # dumb buffer handle (int)
         self._init(connector_index)
-
-    # ── internal helpers ─────────────────────────────────────────────────────
 
     def _ioctl(self, req, arg):
         _ioctl(self.fd, req, arg)
@@ -205,52 +206,31 @@ class DRMDisplay:
         s.value      = value
         try:
             self._ioctl(DRM_IOCTL_SET_CLIENT_CAP, s)
-            print(f"  client cap {cap}={value} OK", file=sys.stderr)
         except OSError as e:
-            print(f"  client cap {cap}={value} failed: {e}", file=sys.stderr)
-
-    # ── init ─────────────────────────────────────────────────────────────────
+            print(f"  cap {cap}={value}: {e}", file=sys.stderr)
 
     def _init(self, connector_index: int):
-        # Acquire DRM master
-        master = SetClientCap()   # reuse struct just for _IO call with no arg
-        try:
-            _libc.ioctl(self.fd, DRM_IOCTL_SET_MASTER, 0)
-        except Exception:
-            pass
-        ret = _libc.ioctl(self.fd, DRM_IOCTL_SET_MASTER, 0)
-        # Non-zero means already master or no permission — check with a real call
         import fcntl as _fcntl
         try:
             _fcntl.ioctl(self.fd, DRM_IOCTL_SET_MASTER, 0)
         except OSError as e:
-            if e.errno not in (0, 16):  # 16 = EBUSY (already master)
+            if e.errno not in (0, 16):
                 raise RuntimeError(
                     f"Cannot acquire DRM master on {self.device}. "
                     "Run as root or: sudo usermod -aG video,render $USER"
                 ) from e
 
-        # Set capabilities BEFORE querying resources — required on Pi/VC4
+        # Must set these caps before GETRESOURCES on Pi/VC4
         self._set_cap(DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1)
         self._set_cap(DRM_CLIENT_CAP_ATOMIC, 1)
 
-        # ── Get resource counts ───────────────────────────────────────────────
         res = ModeRes()
         self._ioctl(DRM_IOCTL_MODE_GETRESOURCES, res)
-        print(f"DRM resources: {res.count_connectors} connectors, "
-              f"{res.count_crtcs} crtcs, {res.count_encoders} encoders",
-              file=sys.stderr)
 
-        # Allocate arrays for second call
-        n_fb   = max(res.count_fbs,        1)
-        n_crtc = max(res.count_crtcs,      1)
-        n_conn = max(res.count_connectors, 1)
-        n_enc  = max(res.count_encoders,   1)
-
-        fb_arr   = (ctypes.c_uint32 * n_fb)()
-        crtc_arr = (ctypes.c_uint32 * n_crtc)()
-        conn_arr = (ctypes.c_uint32 * n_conn)()
-        enc_arr  = (ctypes.c_uint32 * n_enc)()
+        fb_arr   = (ctypes.c_uint32 * max(res.count_fbs,        1))()
+        crtc_arr = (ctypes.c_uint32 * max(res.count_crtcs,      1))()
+        conn_arr = (ctypes.c_uint32 * max(res.count_connectors, 1))()
+        enc_arr  = (ctypes.c_uint32 * max(res.count_encoders,   1))()
 
         res.fb_id_ptr        = ctypes.addressof(fb_arr)
         res.crtc_id_ptr      = ctypes.addressof(crtc_arr)
@@ -259,8 +239,9 @@ class DRMDisplay:
         self._ioctl(DRM_IOCTL_MODE_GETRESOURCES, res)
 
         self._crtc_ids = list(crtc_arr)[:res.count_crtcs]
+        print(f"DRM: {res.count_connectors} connectors, {res.count_crtcs} crtcs",
+              file=sys.stderr)
 
-        # ── Find a connected connector ────────────────────────────────────────
         connected = []
         for conn_id in list(conn_arr)[:res.count_connectors]:
             info, modes, enc_ids = self._get_connector(conn_id)
@@ -268,10 +249,7 @@ class DRMDisplay:
                 connected.append((conn_id, info, modes, enc_ids))
 
         if not connected:
-            raise RuntimeError(
-                f"No connected display found on {self.device}\n"
-                "  Tip: check 'for f in /sys/class/drm/card1-*/status; do echo \"$f: $(cat $f)\"; done'"
-            )
+            raise RuntimeError(f"No connected display found on {self.device}")
 
         idx = min(connector_index, len(connected) - 1)
         conn_id, conn_info, modes, enc_ids = connected[idx]
@@ -289,7 +267,6 @@ class DRMDisplay:
             raise RuntimeError("No CRTC available for connector")
 
     def _get_connector(self, conn_id):
-        # First call — get counts
         info = GetConnector()
         info.connector_id = conn_id
         try:
@@ -301,7 +278,6 @@ class DRMDisplay:
               f"modes={info.count_modes} encoders={info.count_encoders}",
               file=sys.stderr)
 
-        # Second call — fill arrays
         modes_a = (ModeInfo        * max(info.count_modes,    1))()
         encs_a  = (ctypes.c_uint32 * max(info.count_encoders, 1))()
         props_a = (ctypes.c_uint32 * max(info.count_props,    1))()
@@ -331,7 +307,6 @@ class DRMDisplay:
                     return enc.crtc_id
             except OSError:
                 pass
-
         for enc_id in enc_ids:
             enc = GetEncoder()
             enc.encoder_id = enc_id
@@ -344,84 +319,100 @@ class DRMDisplay:
                     return crtc_id
         return None
 
-    # ── frame display ─────────────────────────────────────────────────────────
+    def _free_current(self):
+        """Release the previously displayed framebuffer and dumb buffer."""
+        if self._current_fb is not None:
+            rm = RmFB()
+            rm.fb_id = self._current_fb
+            try: self._ioctl(DRM_IOCTL_MODE_RMFB, rm)
+            except OSError: pass
+            self._current_fb = None
+
+        if self._current_handle is not None:
+            dd = DestroyDumb()
+            dd.handle = self._current_handle
+            try: self._ioctl(DRM_IOCTL_MODE_DESTROY_DUMB, dd)
+            except OSError: pass
+            self._current_handle = None
 
     def present(self, rgba_bytes: bytes, src_w: int, src_h: int, position: str):
-        # Create dumb buffer
+        """
+        Blit RGBA pixels onto a new dumb buffer, flip to it, then release
+        the *previous* buffer.  This keeps the image visible until the next
+        call to present() — no more black flashes.
+        """
+        # Build new dumb buffer
         create        = CreateDumb()
         create.width  = self.width
         create.height = self.height
         create.bpp    = 32
         self._ioctl(DRM_IOCTL_MODE_CREATE_DUMB, create)
 
-        handle = create.handle
-        pitch  = create.pitch
-        size   = create.size
+        new_handle = create.handle
+        pitch      = create.pitch
+        size       = create.size
 
-        try:
-            # Map it
-            md        = MapDumb()
-            md.handle = handle
-            self._ioctl(DRM_IOCTL_MODE_MAP_DUMB, md)
+        # Map and fill
+        md        = MapDumb()
+        md.handle = new_handle
+        self._ioctl(DRM_IOCTL_MODE_MAP_DUMB, md)
 
-            with mmap.mmap(self.fd, size, offset=md.offset) as buf:
-                buf.seek(0)
-                buf.write(b'\x00' * size)   # black background
+        with mmap.mmap(self.fd, size, offset=md.offset) as buf:
+            buf.seek(0)
+            buf.write(b'\x00' * size)
 
-                off_x, off_y = _offset(src_w, src_h, self.width, self.height, position)
-                copy_w = min(src_w, self.width  - off_x)
-                copy_h = min(src_h, self.height - off_y)
-                stride = src_w * 4
+            off_x, off_y = _offset(src_w, src_h, self.width, self.height, position)
+            copy_w = min(src_w, self.width  - off_x)
+            copy_h = min(src_h, self.height - off_y)
+            stride = src_w * 4
 
-                for row in range(copy_h):
-                    src_off = row * stride
-                    dst_off = (off_y + row) * pitch + off_x * 4
-                    row_rgba = rgba_bytes[src_off : src_off + copy_w * 4]
+            for row in range(copy_h):
+                src_off  = row * stride
+                dst_off  = (off_y + row) * pitch + off_x * 4
+                row_rgba = rgba_bytes[src_off : src_off + copy_w * 4]
 
-                    # RGBA → XRGB8888  (stored as B G R X in memory)
-                    bgrx        = bytearray(copy_w * 4)
-                    bgrx[0::4]  = row_rgba[2::4]   # B ← R
-                    bgrx[1::4]  = row_rgba[1::4]   # G
-                    bgrx[2::4]  = row_rgba[0::4]   # R ← B
-                    bgrx[3::4]  = b'\x00' * copy_w
+                bgrx       = bytearray(copy_w * 4)
+                bgrx[0::4] = row_rgba[2::4]   # B ← R
+                bgrx[1::4] = row_rgba[1::4]   # G
+                bgrx[2::4] = row_rgba[0::4]   # R ← B
+                bgrx[3::4] = b'\x00' * copy_w
 
-                    buf.seek(dst_off)
-                    buf.write(bytes(bgrx))
+                buf.seek(dst_off)
+                buf.write(bytes(bgrx))
 
-            # Attach framebuffer
-            fb        = AddFB()
-            fb.width  = self.width
-            fb.height = self.height
-            fb.pitch  = pitch
-            fb.bpp    = 32
-            fb.depth  = 24
-            fb.handle = handle
-            self._ioctl(DRM_IOCTL_MODE_ADDFB, fb)
+        # Attach new framebuffer
+        fb        = AddFB()
+        fb.width  = self.width
+        fb.height = self.height
+        fb.pitch  = pitch
+        fb.bpp    = 32
+        fb.depth  = 24
+        fb.handle = new_handle
+        self._ioctl(DRM_IOCTL_MODE_ADDFB, fb)
+        new_fb_id = fb.fb_id
 
-            try:
-                conn_arr = (ctypes.c_uint32 * 1)(self._connector_id)
-                sc = SetCrtc()
-                sc.crtc_id            = self._crtc_id
-                sc.fb_id              = fb.fb_id
-                sc.x                  = 0
-                sc.y                  = 0
-                sc.set_connectors_ptr = ctypes.addressof(conn_arr)
-                sc.count_connectors   = 1
-                sc.mode_valid         = 1
-                sc.mode               = self._mode
-                self._ioctl(DRM_IOCTL_MODE_SETCRTC, sc)
-            finally:
-                rm = RmFB()
-                rm.fb_id = fb.fb_id
-                try: self._ioctl(DRM_IOCTL_MODE_RMFB, rm)
-                except OSError: pass
-        finally:
-            dd = DestroyDumb()
-            dd.handle = handle
-            try: self._ioctl(DRM_IOCTL_MODE_DESTROY_DUMB, dd)
-            except OSError: pass
+        # Flip to new framebuffer
+        conn_arr = (ctypes.c_uint32 * 1)(self._connector_id)
+        sc = SetCrtc()
+        sc.crtc_id            = self._crtc_id
+        sc.fb_id              = new_fb_id
+        sc.x                  = 0
+        sc.y                  = 0
+        sc.set_connectors_ptr = ctypes.addressof(conn_arr)
+        sc.count_connectors   = 1
+        sc.mode_valid         = 1
+        sc.mode               = self._mode
+        self._ioctl(DRM_IOCTL_MODE_SETCRTC, sc)
+
+        # NOW it's safe to free the old buffer — the display is scanning the new one
+        self._free_current()
+
+        # Remember new buffer so we can free it on the next frame
+        self._current_fb     = new_fb_id
+        self._current_handle = new_handle
 
     def close(self):
+        self._free_current()
         import fcntl as _fcntl
         try: _fcntl.ioctl(self.fd, DRM_IOCTL_DROP_MASTER, 0)
         except OSError: pass
@@ -446,9 +437,9 @@ IMAGE_EXTS = {".jpg",".jpeg",".png",".gif",".bmp",".tiff",".tif",".webp"}
 
 def play_image(display, path, duration, position):
     print(f"Image: {path}", file=sys.stderr)
-    img  = Image.open(path).convert("RGBA")
+    img = Image.open(path).convert("RGBA")
     display.present(img.tobytes(), img.width, img.height, position)
-    time.sleep(duration)
+    time.sleep(duration)   # buffer stays alive — image stays on screen
 
 
 # =============================================================================
@@ -460,7 +451,7 @@ def play_video(display, path, position):
     container = av.open(str(path))
     stream = next((s for s in container.streams if s.type == "video"), None)
     if not stream:
-        print(f"  No video stream, skipping", file=sys.stderr)
+        print("  No video stream, skipping", file=sys.stderr)
         return
 
     for s in container.streams:
